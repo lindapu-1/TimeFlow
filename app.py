@@ -20,6 +20,8 @@ import httpx
 import tempfile
 import subprocess
 import re
+from collections import Counter
+import re
 
 # 配置日志
 logging.basicConfig(level=logging.INFO)
@@ -72,7 +74,9 @@ client = OpenAI(
 # API 配置
 TRANSCRIPTION_API_URL = "https://space.ai-builders.com/backend/v1/audio/transcriptions"
 TIME_LOG_FILE = "data/time_log.json"
-RECENT_EVENT_FILE = "data/recent_event.json"  # 存储最近写入的事件信息
+RECENT_EVENT_FILE = "data/recent_event.json"  # 存储最近写入的事件信息（用于快速撤回）
+EVENT_HISTORY_FILE = "data/event_history.json"  # 存储所有历史事件记录（每次操作 append）
+TAGS_FILE = "data/tags.json"  # 存储标签配置（用户自定义标签）
 
 # 确保数据目录存在
 os.makedirs("data", exist_ok=True)
@@ -102,16 +106,30 @@ USE_DOUBAO = os.getenv("USE_DOUBAO", "true").lower() == "true"  # 默认使用�
 
 
 def get_funasr_model():
-    """懒加载 FunASR 模型"""
+    """懒加载 FunASR 模型（包含标点符号恢复）"""
     global funasr_model
     if funasr_model is None and FUNASR_AVAILABLE:
         try:
             logger.info(f"加载 FunASR 模型: {FUNASR_MODEL_NAME}")
-            funasr_model = AutoModel(model=FUNASR_MODEL_NAME, model_revision="v2.0.4")
-            logger.info("✅ FunASR 模型加载成功")
+            # 启用标点符号恢复：使用 punc_model 参数
+            # FunASR 会自动下载并使用标点符号恢复模型
+            funasr_model = AutoModel(
+                model=FUNASR_MODEL_NAME, 
+                model_revision="v2.0.4",
+                punc_model="ct-punc",  # 启用标点符号恢复模型
+                punc_model_revision="v2.0.4"
+            )
+            logger.info("✅ FunASR 模型加载成功（已启用标点符号恢复）")
         except Exception as e:
             logger.error(f"❌ FunASR 模型加载失败: {e}")
-            funasr_model = None
+            # 如果标点符号模型加载失败，尝试不使用标点符号模型（向后兼容）
+            try:
+                logger.warning("尝试加载不带标点符号的模型...")
+                funasr_model = AutoModel(model=FUNASR_MODEL_NAME, model_revision="v2.0.4")
+                logger.info("✅ FunASR 模型加载成功（未启用标点符号恢复）")
+            except Exception as e2:
+                logger.error(f"❌ FunASR 模型加载失败（无标点符号）: {e2}")
+                funasr_model = None
     return funasr_model
 
 def get_whisper_model():
@@ -181,11 +199,31 @@ def load_prompts_from_file():
 
 
 def get_system_prompt(current_time_str: str) -> str:
-    """获取格式化后的 System Prompt"""
+    """获取格式化后的 System Prompt（动态加载标签信息）"""
     template, _ = load_prompts_from_file()
     
+    # 加载标签配置，生成标签分类规则
+    tags_config = load_tags_config()
+    tags = tags_config.get("tags", [])
+    
+    # 构建标签分类规则文本（只使用描述）
+    tag_rules = []
+    tag_list = []
+    for tag in tags:
+        tag_name = tag.get("name", "")
+        tag_desc = tag.get("description", "")
+        if tag_name:
+            tag_list.append(tag_name)
+            if tag_desc:
+                tag_rules.append(f"- **{tag_name}**：{tag_desc}")
+            else:
+                tag_rules.append(f"- **{tag_name}**")
+    
+    tag_rules_text = "\n".join(tag_rules)
+    tag_list_text = "、".join(tag_list) if tag_list else "工作、生活、娱乐、运动"
+    
     if template is None:
-        # 使用默认 prompt（向后兼容）
+        # Fallback to default hardcoded prompt（使用动态标签）
         return f"""你是一个时间提取助手。从用户提供的文本中提取时间相关的信息，并返回 JSON 格式的数据。你需要根据用户的描述，帮助用户记录时间，提取出时间块（duration），包括开始时间和结束时间。在两个时间点中间，可能需要一定的适当推理得出这块时间在做什么。
 
 **重要提示**：
@@ -199,6 +237,15 @@ def get_system_prompt(current_time_str: str) -> str:
 3. **end_time** (结束时间) - 必需，格式：YYYY-MM-DDTHH:MM:SS（ISO 8601，24小时制），如果文本中没有明确时间，根据当前时间和相对时间推断
 4. **location** (地点) - 可选，如果文本中提到地点则提取
 5. **description** (详细描述) - 可选，可以包含原始文本或额外信息
+6. **tag** (标签分类) - 必需，根据活动内容自动分类为以下标签之一：**{tag_list_text}**
+
+**标签分类规则**：
+{tag_rules_text}
+
+**标签判断方法**：
+- 根据 activity 和 description 的内容，结合标签描述进行判断
+- 如果活动同时匹配多个标签，选择最匹配的一个
+- 如果无法确定，默认使用"生活"
 
 **严格格式要求**：
 - 只返回 JSON 数组，不要有任何其他文字
@@ -241,7 +288,11 @@ def get_system_prompt(current_time_str: str) -> str:
 
 6. **避免过度分割**：只提取有意义的时间块，不要将"到达"、"开始"等瞬间动作单独提取。但如果文本明确提到多个时间段，必须全部提取"""
     
-    # 替换模板变量
+    # 如果模板中包含 {tag_rules} 或 {tag_list}，替换它们
+    if template:
+        template = template.replace("{tag_rules}", tag_rules_text)
+        template = template.replace("{tag_list}", tag_list_text)
+    
     return template.format(current_time_str=current_time_str)
 
 
@@ -249,6 +300,9 @@ def get_user_prompt(transcript: str, current_time_str: str, current_time_iso: st
                      current_dt: datetime, past_30min_str: str) -> str:
     """获取格式化后的 User Prompt"""
     _, template = load_prompts_from_file()
+    
+    # 预先计算日期字符串（避免在模板中使用 Python 代码）
+    current_date_str = current_dt.strftime('%Y-%m-%d')
     
     if template is None:
         # 使用默认 prompt（向后兼容）
@@ -273,8 +327,8 @@ def get_user_prompt(transcript: str, current_time_str: str, current_time_iso: st
   - 时间点：8点，9点，9点半
   - 时间段1（8点-9点）：通勤/去咖啡厅，地点：咖啡厅
   - 时间段2（9点-9点半）：学习，地点：咖啡厅
-  - 结果：[{{"activity": "通勤/去咖啡厅", "start_time": "{current_dt.strftime('%Y-%m-%d')}T08:00:00", "end_time": "{current_dt.strftime('%Y-%m-%d')}T09:00:00", "location": "咖啡厅"}},
-         {{"activity": "学习", "start_time": "{current_dt.strftime('%Y-%m-%d')}T09:00:00", "end_time": "{current_dt.strftime('%Y-%m-%d')}T09:30:00", "location": "咖啡厅"}}]
+  - 结果：[{{"activity": "通勤/去咖啡厅", "start_time": "{current_date_str}T08:00:00", "end_time": "{current_date_str}T09:00:00", "location": "咖啡厅"}},
+         {{"activity": "学习", "start_time": "{current_date_str}T09:00:00", "end_time": "{current_date_str}T09:30:00", "location": "咖啡厅"}}]
 
 - 示例2：文本"刚刚半小时我在吃饭"
   - 时间点：半小时前（{past_30min_str}），现在（{current_time_iso}）
@@ -289,12 +343,18 @@ def get_user_prompt(transcript: str, current_time_str: str, current_time_iso: st
     
     # 替换模板变量
     # 注意：模板中使用 {transcript} 而不是 {request.transcript}
+    # 如果模板中有 {current_dt.strftime('%Y-%m-%d')}，需要先替换为计算好的日期字符串
+    if template and '{current_dt.strftime' in template:
+        # 替换模板中的 Python 代码为实际值
+        template = template.replace('{current_dt.strftime(\'%Y-%m-%d\')}', current_date_str)
+    
     return template.format(
         transcript=transcript,
         current_time_str=current_time_str,
         current_time_iso=current_time_iso,
         current_dt=current_dt,
-        past_30min_str=past_30min_str
+        past_30min_str=past_30min_str,
+        current_date=current_date_str  # 添加预计算的日期字符串
     )
 
 
@@ -328,6 +388,9 @@ class CalendarEventRequest(BaseModel):
     end_time: str
     description: Optional[str] = None
     location: Optional[str] = None
+    calendar_name: Optional[str] = None  # 日历名称（标签），默认使用 "TimeFlow"
+    tag: Optional[str] = None  # 标签名称（用于前端显示）
+    recurrence: Optional[str] = None  # 重复规则: "daily", "weekly", "monthly", "yearly"
 
 
 # 工具函数
@@ -338,20 +401,107 @@ def escape_apple_script(text):
     return text.replace('\\', '\\\\').replace('"', '\\"').replace('\n', '\\n')
 
 
+def load_tags_config() -> dict:
+    """加载标签配置"""
+    if os.path.exists(TAGS_FILE):
+        try:
+            with open(TAGS_FILE, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except Exception as e:
+            logger.warning(f"加载标签配置失败: {e}，使用默认配置")
+    
+    # 返回默认配置
+    return {
+        "tags": [
+            {"id": "work", "name": "工作", "description": "工作相关活动", "color": "#FF6B6B", "is_default": True},
+            {"id": "life", "name": "生活", "description": "日常生活活动", "color": "#95E1D3", "is_default": True},
+            {"id": "entertainment", "name": "娱乐", "description": "娱乐休闲活动", "color": "#F38181", "is_default": True},
+            {"id": "sports", "name": "运动", "description": "运动健身活动", "color": "#AA96DA", "is_default": True}
+        ]
+    }
+
+
+def get_tag_by_name(tag_name: str) -> dict:
+    """根据标签名称获取标签信息（包括颜色）"""
+    tags_config = load_tags_config()
+    for tag in tags_config.get("tags", []):
+        if tag.get("name") == tag_name:
+            return tag
+    # 如果找不到，返回默认标签
+    return {"id": "life", "name": "生活", "color": "#95E1D3"}
+
+
+def classify_activity_tag(activity: str, description: str = "") -> str:
+    """
+    根据活动内容自动分类标签（仅作为后备，主要依赖 LLM 分类）
+    
+    注意：现在分类主要依赖 LLM 根据 prompt 中的标签描述进行判断。
+    此函数仅作为后备方案，当 LLM 没有返回有效标签时使用。
+    
+    Args:
+        activity: 活动名称
+        description: 活动描述
+    
+    Returns:
+        标签名称（默认返回"生活"）
+    """
+    # 现在完全依赖 LLM 的分类，这里只返回默认值
+    # 如果需要，可以根据描述进行简单的文本匹配，但主要应该依赖 LLM
+    return "生活"  # 默认标签
+
+
 def save_recent_events(event_ids: List[str], events_data: List[dict]):
-    """保存最近写入的多个事件信息（一次操作可能写入多个事件）"""
+    """保存最近写入的多个事件信息（一次操作可能写入多个事件）
+    同时保存到历史记录文件（append）和最近事件文件（覆盖）
+    """
     events_info = {
         "event_ids": event_ids,  # 多个事件ID
         "events": events_data,  # 多个事件的完整数据
         "created_at": datetime.now().isoformat(),
         "count": len(event_ids)
     }
+    
     try:
+        # 1. 保存到最近事件文件（用于快速撤回）
         with open(RECENT_EVENT_FILE, 'w', encoding='utf-8') as f:
             json.dump(events_info, f, ensure_ascii=False, indent=2)
         logger.info(f"已保存最近 {len(event_ids)} 个事件信息")
+        
+        # 2. 追加到历史记录文件（保留所有操作历史）
+        history_entry = {
+            "id": f"op_{datetime.now().strftime('%Y%m%d%H%M%S')}_{len(event_ids)}",
+            **events_info
+        }
+        
+        # 读取现有历史记录
+        if os.path.exists(EVENT_HISTORY_FILE):
+            with open(EVENT_HISTORY_FILE, 'r', encoding='utf-8') as f:
+                history = json.load(f)
+        else:
+            history = {"operations": []}
+        
+        # 追加新操作到开头（最新的在前面）
+        history["operations"].insert(0, history_entry)
+        
+        # 保存历史记录
+        with open(EVENT_HISTORY_FILE, 'w', encoding='utf-8') as f:
+            json.dump(history, f, ensure_ascii=False, indent=2)
+        logger.info(f"已追加到历史记录，共 {len(history['operations'])} 次操作")
+        
     except Exception as e:
-        logger.warning(f"保存最近事件信息失败: {e}")
+        logger.warning(f"保存事件信息失败: {e}")
+
+
+def hex_to_rgb(hex_color: str) -> tuple:
+    """将十六进制颜色转换为 RGB 元组 (0-65535)"""
+    hex_color = hex_color.lstrip('#')
+    if len(hex_color) == 6:
+        r = int(hex_color[0:2], 16)
+        g = int(hex_color[2:4], 16)
+        b = int(hex_color[4:6], 16)
+        # AppleScript 使用 0-65535 范围的 RGB
+        return (r * 257, g * 257, b * 257)
+    return (49152, 49152, 49152)  # 默认灰色
 
 
 def add_to_calendar_via_applescript(event_data: dict) -> dict:
@@ -360,10 +510,14 @@ def add_to_calendar_via_applescript(event_data: dict) -> dict:
     start_time = event_data.get('start_time')
     end_time = event_data.get('end_time')
     description = event_data.get('description', '') or event_data.get('location', '')
+    calendar_name = event_data.get('calendar_name', 'TimeFlow')  # 默认使用 TimeFlow
+    recurrence = event_data.get('recurrence')  # 重复规则
+    tag_color = event_data.get('tag_color')  # 标签颜色（十六进制，如 #FF6B6B）
     
     # 转义特殊字符
     escaped_activity = escape_apple_script(activity)
     escaped_description = escape_apple_script(description)
+    escaped_calendar = escape_apple_script(calendar_name)
     
     # 格式化日期
     if start_time:
@@ -388,21 +542,47 @@ def add_to_calendar_via_applescript(event_data: dict) -> dict:
     commands = [
         'tell application "Calendar"',
         'activate',
-        'set calendarName to "TimeFlow"',
+        f'set calendarName to "{escaped_calendar}"',
         'try',
-        'set targetCalendar to calendar calendarName',
+        f'set targetCalendar to calendar calendarName',
         'on error',
-        'make new calendar with properties {name:calendarName}',
-        'set targetCalendar to calendar calendarName',
-        'end try',
+        f'make new calendar with properties {{name:calendarName}}',
+        f'set targetCalendar to calendar calendarName',
+        'end try'
+    ]
+    
+    # 如果提供了标签颜色，设置日历颜色
+    if tag_color:
+        try:
+            r, g, b = hex_to_rgb(tag_color)
+            commands.append(f'set color of targetCalendar to {{{r}, {g}, {b}}}')
+            logger.info(f"设置日历颜色: {calendar_name} -> {tag_color} (RGB: {r}, {g}, {b})")
+        except Exception as e:
+            logger.warning(f"设置日历颜色失败: {e}")
+    
+    commands.extend([
         'tell targetCalendar',
         f'make new event at end with properties {{summary:"{escaped_activity}", start date:(current date) + {start_seconds}, end date:(current date) + {end_seconds}, description:"{escaped_description}"}}',
-        'set newEvent to result',
+        'set newEvent to result'
+    ])
+    
+    # 添加重复规则（如果指定）
+    if recurrence:
+        if recurrence == "daily":
+            commands.append('set recurrence of newEvent to "FREQ=DAILY;INTERVAL=1"')
+        elif recurrence == "weekly":
+            commands.append('set recurrence of newEvent to "FREQ=WEEKLY;INTERVAL=1"')
+        elif recurrence == "monthly":
+            commands.append('set recurrence of newEvent to "FREQ=MONTHLY;INTERVAL=1"')
+        elif recurrence == "yearly":
+            commands.append('set recurrence of newEvent to "FREQ=YEARLY;INTERVAL=1"')
+    
+    commands.extend([
         'set eventId to id of newEvent',
         'return eventId',
         'end tell',
         'end tell'
-    ]
+    ])
     
     # 转义单引号
     escaped_commands = [c.replace("'", "'\\''") for c in commands]
@@ -431,8 +611,130 @@ def add_to_calendar_via_applescript(event_data: dict) -> dict:
 
 
 def undo_last_events_via_applescript() -> dict:
-    """撤回最近写入的多个日历事件（一次操作的所有事件）"""
-    # 读取最近的事件信息
+    """撤回最近写入的多个日历事件（一次操作的所有事件）
+    从历史记录中删除最近一次操作，并更新最近事件文件
+    """
+    # 优先从历史记录读取（更可靠）
+    if os.path.exists(EVENT_HISTORY_FILE):
+        try:
+            with open(EVENT_HISTORY_FILE, 'r', encoding='utf-8') as f:
+                history = json.load(f)
+            
+            operations = history.get("operations", [])
+            if not operations:
+                return {"success": False, "error": "历史记录为空"}
+            
+            # 获取最近一次操作
+            last_operation = operations[0]
+            event_ids = last_operation.get("event_ids", [])
+            events_data = last_operation.get("events", [])
+            
+            if not event_ids:
+                return {"success": False, "error": "事件ID列表为空"}
+            
+            # 逐个删除事件，记录每个事件的删除状态
+            delete_results = []
+            for i, (event_id, event_data) in enumerate(zip(event_ids, events_data)):
+                activity = event_data.get("activity", "未命名活动")
+                try:
+                    # 构建单个事件的删除命令
+                    commands = [
+                        'tell application "Calendar"',
+                        'activate',
+                        'set calendarName to "TimeFlow"',
+                        'set targetCalendar to calendar calendarName',
+                        'tell targetCalendar',
+                        f'set eventToDelete to event id "{event_id}"',
+                        'delete eventToDelete',
+                        'return "success"',
+                        'end tell',
+                        'end tell'
+                    ]
+                    
+                    escaped_commands = [c.replace("'", "'\\''") for c in commands]
+                    cmd = "osascript " + " ".join([f"-e '{c}'" for c in escaped_commands])
+                    
+                    result = subprocess.run(
+                        cmd,
+                        shell=True,
+                        capture_output=True,
+                        text=True,
+                        timeout=10
+                    )
+                    
+                    if result.returncode == 0:
+                        delete_results.append({
+                            "event_id": event_id,
+                            "activity": activity,
+                            "success": True
+                        })
+                    else:
+                        error_msg = result.stderr.strip() or result.stdout.strip() or "未知错误"
+                        # 检查是否是事件不存在的错误（-1728）
+                        if "-1728" in error_msg or "Can't get event" in error_msg or "对象不存在" in error_msg:
+                            error_msg = "事件不存在（可能已被手动删除）"
+                        delete_results.append({
+                            "event_id": event_id,
+                            "activity": activity,
+                            "success": False,
+                            "error": error_msg
+                        })
+                except Exception as e:
+                    error_msg = str(e)
+                    # 检查是否是事件不存在的错误
+                    if "-1728" in error_msg or "Can't get event" in error_msg:
+                        error_msg = "事件不存在（可能已被手动删除）"
+                    delete_results.append({
+                        "event_id": event_id,
+                        "activity": activity,
+                        "success": False,
+                        "error": error_msg
+                    })
+            
+            # 统计成功和失败的数量
+            success_count = sum(1 for r in delete_results if r.get("success"))
+            failed_count = len(delete_results) - success_count
+            
+            # 如果至少有一个成功，更新历史记录
+            if success_count > 0:
+                # 从历史记录中删除最近一次操作
+                operations.pop(0)
+                history["operations"] = operations
+                
+                with open(EVENT_HISTORY_FILE, 'w', encoding='utf-8') as f:
+                    json.dump(history, f, ensure_ascii=False, indent=2)
+                
+                # 更新最近事件文件（如果有下一个操作）
+                if operations:
+                    next_operation = operations[0]
+                    with open(RECENT_EVENT_FILE, 'w', encoding='utf-8') as f:
+                        json.dump({
+                            "event_ids": next_operation.get("event_ids", []),
+                            "events": next_operation.get("events", []),
+                            "created_at": next_operation.get("created_at"),
+                            "count": next_operation.get("count", 0)
+                        }, f, ensure_ascii=False, indent=2)
+                else:
+                    # 没有更多操作，删除最近事件文件
+                    if os.path.exists(RECENT_EVENT_FILE):
+                        os.remove(RECENT_EVENT_FILE)
+            
+            # 即使所有事件都失败，也返回结果（而不是抛出异常）
+            # 这样前端可以显示每个事件的详细状态
+            return {
+                "success": success_count > 0,  # 至少有一个成功才算整体成功
+                "message": f"成功撤回 {success_count} 个事件，失败 {failed_count} 个",
+                "deleted_count": success_count,
+                "failed_count": failed_count,
+                "results": delete_results,  # 每个事件的删除结果
+                "deleted_events": events_data
+            }
+                
+        except Exception as e:
+            logger.error(f"从历史记录撤回失败: {e}")
+            # Fallback 到旧的逻辑
+    
+    # Fallback：使用旧的最近事件文件（向后兼容）
     if not os.path.exists(RECENT_EVENT_FILE):
         return {"success": False, "error": "没有找到最近写入的事件"}
     
@@ -440,13 +742,10 @@ def undo_last_events_via_applescript() -> dict:
         with open(RECENT_EVENT_FILE, 'r', encoding='utf-8') as f:
             events_info = json.load(f)
         
-        # 支持新旧格式兼容
         if "event_ids" in events_info:
-            # 新格式：多个事件
             event_ids = events_info.get("event_ids", [])
             events_data = events_info.get("events", [])
         elif "event_id" in events_info:
-            # 旧格式：单个事件（兼容）
             event_ids = [events_info.get("event_id")]
             events_data = [events_info]
         else:
@@ -455,51 +754,81 @@ def undo_last_events_via_applescript() -> dict:
         if not event_ids:
             return {"success": False, "error": "事件ID列表为空"}
         
-        # 构建 AppleScript 命令（删除多个事件）
-        commands = [
-            'tell application "Calendar"',
-            'activate',
-            'set calendarName to "TimeFlow"',
-            'set targetCalendar to calendar calendarName',
-            'tell targetCalendar'
-        ]
+        # 逐个删除事件，记录每个事件的删除状态（与主逻辑一致）
+        delete_results = []
+        for i, (event_id, event_data) in enumerate(zip(event_ids, events_data)):
+            activity = event_data.get("activity", "未命名活动") if isinstance(event_data, dict) else "未命名活动"
+            try:
+                commands = [
+                    'tell application "Calendar"',
+                    'activate',
+                    'set calendarName to "TimeFlow"',
+                    'set targetCalendar to calendar calendarName',
+                    'tell targetCalendar',
+                    f'set eventToDelete to event id "{event_id}"',
+                    'delete eventToDelete',
+                    'return "success"',
+                    'end tell',
+                    'end tell'
+                ]
+                
+                escaped_commands = [c.replace("'", "'\\''") for c in commands]
+                cmd = "osascript " + " ".join([f"-e '{c}'" for c in escaped_commands])
+                
+                result = subprocess.run(
+                    cmd,
+                    shell=True,
+                    capture_output=True,
+                    text=True,
+                    timeout=10
+                )
+                
+                if result.returncode == 0:
+                    delete_results.append({
+                        "event_id": event_id,
+                        "activity": activity,
+                        "success": True
+                    })
+                else:
+                    error_msg = result.stderr.strip() or result.stdout.strip() or "未知错误"
+                    # 检查是否是事件不存在的错误（-1728）
+                    if "-1728" in error_msg or "Can't get event" in error_msg or "对象不存在" in error_msg:
+                        error_msg = "事件不存在（可能已被手动删除）"
+                    delete_results.append({
+                        "event_id": event_id,
+                        "activity": activity,
+                        "success": False,
+                        "error": error_msg
+                    })
+            except Exception as e:
+                error_msg = str(e)
+                # 检查是否是事件不存在的错误
+                if "-1728" in error_msg or "Can't get event" in error_msg:
+                    error_msg = "事件不存在（可能已被手动删除）"
+                delete_results.append({
+                    "event_id": event_id,
+                    "activity": activity,
+                    "success": False,
+                    "error": error_msg
+                })
         
-        # 为每个事件ID添加删除命令
-        for event_id in event_ids:
-            commands.append(f'set eventToDelete to event id "{event_id}"')
-            commands.append('delete eventToDelete')
+        # 统计成功和失败的数量
+        success_count = sum(1 for r in delete_results if r.get("success"))
+        failed_count = len(delete_results) - success_count
         
-        commands.extend([
-            'return "success"',
-            'end tell',
-            'end tell'
-        ])
-        
-        # 转义单引号
-        escaped_commands = [c.replace("'", "'\\''") for c in commands]
-        
-        # 使用多个 -e 参数执行 AppleScript
-        cmd = "osascript " + " ".join([f"-e '{c}'" for c in escaped_commands])
-        
-        result = subprocess.run(
-            cmd,
-            shell=True,
-            capture_output=True,
-            text=True,
-            timeout=30  # 多个事件可能需要更长时间
-        )
-        
-        if result.returncode == 0:
-            # 删除事件信息文件
+        # 如果至少有一个成功，删除最近事件文件
+        if success_count > 0:
             os.remove(RECENT_EVENT_FILE)
-            return {
-                "success": True,
-                "message": f"已撤回 {len(event_ids)} 个事件",
-                "deleted_count": len(event_ids),
-                "deleted_events": events_data
-            }
-        else:
-            return {"success": False, "error": result.stderr.strip()}
+        
+        # 即使所有事件都失败，也返回结果（而不是抛出异常）
+        return {
+            "success": success_count > 0,  # 至少有一个成功才算整体成功
+            "message": f"成功撤回 {success_count} 个事件，失败 {failed_count} 个",
+            "deleted_count": success_count,
+            "failed_count": failed_count,
+            "results": delete_results,
+            "deleted_events": events_data if isinstance(events_data, list) else [events_data]
+        }
             
     except FileNotFoundError:
         return {"success": False, "error": "没有找到最近写入的事件"}
@@ -519,11 +848,9 @@ async def root():
         raise FileNotFoundError("CalendarApp/static/index.html 不存在")
 
 
-# 挂载静态文件（使用 CalendarApp 的静态文件）
+# 静态文件路由将在所有 API 路由注册后挂载（见文件末尾）
 calendar_app_static_dir = os.path.join("CalendarApp", "static")
-if os.path.exists(calendar_app_static_dir):
-    app.mount("/static", StaticFiles(directory=calendar_app_static_dir), name="static")
-else:
+if not os.path.exists(calendar_app_static_dir):
     raise FileNotFoundError("CalendarApp/static 目录不存在")
 
 
@@ -573,16 +900,24 @@ async def transcribe_audio(
             if model is None:
                 raise Exception("FunASR 模型未加载")
             
-            # 保存上传的文件到临时文件
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp_file:
+            # 保存上传的文件到临时文件（保持原始格式）
+            audio_ext = os.path.splitext(audio_file.filename)[1] if audio_file.filename else '.wav'
+            if not audio_ext or audio_ext == '':
+                audio_ext = '.wav'  # 默认使用 wav
+            
+            with tempfile.NamedTemporaryFile(delete=False, suffix=audio_ext) as tmp_file:
                 content = await audio_file.read()
                 tmp_file.write(content)
                 tmp_file_path = tmp_file.name
             
             try:
                 # 转录音频
+                logger.info(f"FunASR 开始转写，文件: {tmp_file_path}")
                 res = model.generate(input=tmp_file_path)
                 transcript = res[0]["text"] if res and len(res) > 0 else ""
+                
+                if not transcript:
+                    raise Exception("FunASR 返回空文本")
                 
                 logger.info(f"FunASR 转录成功: {transcript[:50]}...")
                 
@@ -596,10 +931,13 @@ async def transcribe_audio(
                 }
             finally:
                 # 清理临时文件
-                os.unlink(tmp_file_path)
+                if os.path.exists(tmp_file_path):
+                    os.unlink(tmp_file_path)
                 
         except Exception as e:
             logger.error(f"FunASR 转录失败: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
             # 回退到其他模型
             use_local_stt = True  # 继续尝试其他本地模型
     
@@ -877,11 +1215,14 @@ async def analyze_time_entry(request: TimeAnalysisRequest):
             # 如果返回的是数组，处理多个时间块
             if isinstance(time_data, list):
                 if len(time_data) == 0:
-                    raise ValueError("AI 返回了空数组")
-                # 支持多个时间块，返回数组格式
-                logger.info(f"AI 返回了 {len(time_data)} 个时间块")
-                logger.info(f"所有时间块: {json.dumps(time_data, ensure_ascii=False, indent=2)}")
-                # 保持数组格式，前端会处理多个事件
+                    # AI 返回了空数组，这是正常的（表示没有检测到时间信息），继续处理
+                    logger.info("AI 返回了空数组（表示没有检测到时间信息）")
+                    time_data = []  # 保持空数组，让后续验证逻辑处理
+                else:
+                    # 支持多个时间块，返回数组格式
+                    logger.info(f"AI 返回了 {len(time_data)} 个时间块")
+                    logger.info(f"所有时间块: {json.dumps(time_data, ensure_ascii=False, indent=2)}")
+                    # 保持数组格式，前端会处理多个事件
             elif isinstance(time_data, dict):
                 # 如果是单个对象，转换为数组格式（统一格式）
                 time_data = [time_data]
@@ -897,10 +1238,56 @@ async def analyze_time_entry(request: TimeAnalysisRequest):
             if not isinstance(time_data, list):
                 time_data = [time_data] if isinstance(time_data, dict) else []
             
-            # 处理每个时间块
+            # 处理每个时间块，验证并过滤无效的时间块
             processed_time_data = []
             for time_block in time_data:
                 if not isinstance(time_block, dict):
+                    continue
+                
+                # 验证时间块的有效性
+                start_time_str = time_block.get('start_time', '')
+                end_time_str = time_block.get('end_time', '')
+                activity = time_block.get('activity', '').strip()
+                
+                # 如果缺少开始时间或结束时间，跳过
+                if not start_time_str or not end_time_str:
+                    logger.warning(f"时间块缺少开始时间或结束时间，跳过: {activity}")
+                    continue
+                
+                # 如果活动名称为空或无效（如"无"、"没有"），跳过
+                if not activity or activity.lower() in ['无', '没有', 'none', 'null', '']:
+                    logger.warning(f"时间块活动名称为空或无效，跳过: {activity}")
+                    continue
+                
+                try:
+                    # 解析时间
+                    if 'Z' in start_time_str:
+                        start_dt = datetime.fromisoformat(start_time_str.replace('Z', '+00:00'))
+                    else:
+                        start_dt = datetime.fromisoformat(start_time_str)
+                    
+                    if 'Z' in end_time_str:
+                        end_dt = datetime.fromisoformat(end_time_str.replace('Z', '+00:00'))
+                    else:
+                        end_dt = datetime.fromisoformat(end_time_str)
+                    
+                    # 移除时区信息
+                    if start_dt.tzinfo:
+                        start_dt = start_dt.replace(tzinfo=None)
+                    if end_dt.tzinfo:
+                        end_dt = end_dt.replace(tzinfo=None)
+                    
+                    # 验证时间段有效性
+                    duration_seconds = (end_dt - start_dt).total_seconds()
+                    
+                    # 如果开始时间 >= 结束时间，或持续时间少于1分钟，跳过
+                    if duration_seconds <= 60:  # 少于1分钟视为无效
+                        logger.warning(f"时间块持续时间过短（{duration_seconds}秒），跳过: {activity} ({start_time_str} - {end_time_str})")
+                        continue
+                    
+                    # 时间块有效，继续处理
+                except Exception as e:
+                    logger.warning(f"时间块时间解析失败，跳过: {activity}, 错误: {e}")
                     continue
                     
                 # 在描述字段末尾添加模型名称
@@ -910,6 +1297,25 @@ async def analyze_time_entry(request: TimeAnalysisRequest):
                     time_block['description'] = f"{current_description} [模型: {model_name}]"
                 else:
                     time_block['description'] = f"[模型: {model_name}]"
+                
+                # 处理标签（tag）字段
+                # 如果 AI 没有返回 tag，或 tag 为空/无效，根据关键词自动分类
+                tags_config = load_tags_config()
+                valid_tag_names = [tag.get("name") for tag in tags_config.get("tags", [])]
+                
+                current_tag = time_block.get('tag', '').strip()
+                
+                if not current_tag or current_tag == '未分类' or current_tag not in valid_tag_names:
+                    # 自动分类
+                    tag = classify_activity_tag(
+                        time_block.get('activity', ''),
+                        current_description
+                    )
+                    time_block['tag'] = tag
+                    logger.info(f"自动分类标签: {time_block.get('activity')} -> {tag}")
+                else:
+                    # AI 返回了有效的 tag，使用它
+                    logger.info(f"使用AI返回的标签: {time_block.get('activity')} -> {current_tag}")
                 
                 # 修正相对时间
                 if has_relative_time:
@@ -980,6 +1386,18 @@ async def analyze_time_entry(request: TimeAnalysisRequest):
                 
                 processed_time_data.append(time_block)
             
+            # 如果处理后没有有效的时间块，返回空数组
+            if not processed_time_data:
+                logger.warning("处理后没有有效的时间块（可能因为时间点无效、时间段过短、或活动名称为空）")
+                return {
+                    "success": True,
+                    "data": [],
+                    "raw_response": ai_response,
+                    "method": analysis_method,
+                    "model": model_name,
+                    "message": "未检测到有效的时间段（需要完整的开始时间和结束时间，且持续时间至少1分钟）"
+                }
+            
             time_data = processed_time_data
         except json.JSONDecodeError:
             logger.warning(f"AI 返回的不是有效 JSON，尝试修复: {ai_response}")
@@ -1045,12 +1463,30 @@ async def add_to_calendar_api(request: CalendarEventRequest):
         添加结果（包含事件ID）
     """
     try:
+        # 如果请求中没有指定 calendar_name，尝试从事件数据中获取 tag
+        calendar_name = request.calendar_name
+        if not calendar_name:
+            # 可以从事件数据中提取 tag（如果前端传递了）
+            # 这里暂时使用请求中的 calendar_name，如果没有则使用默认值
+            calendar_name = "TimeFlow"
+        
+        # 从请求中获取 tag，如果没有则从 calendar_name 推断
+        tag = getattr(request, 'tag', None) or calendar_name
+        
+        # 根据 tag 获取标签颜色
+        tag_info = get_tag_by_name(tag)
+        tag_color = tag_info.get("color", "#95E1D3")
+        
         event_data = {
             "activity": request.activity,
             "start_time": request.start_time,
             "end_time": request.end_time,
             "description": request.description or "",
-            "location": request.location or ""
+            "location": request.location or "",
+            "calendar_name": calendar_name,  # 支持指定日历（标签）
+            "tag": tag,  # 保存 tag 字段用于前端显示
+            "tag_color": tag_color,  # 标签颜色（用于设置日历颜色）
+            "recurrence": request.recurrence  # 支持重复规则
         }
         
         result = add_to_calendar_via_applescript(event_data)
@@ -1094,12 +1530,21 @@ async def add_multiple_to_calendar_api(events: List[CalendarEventRequest]):
         errors = []
         
         for event_request in events:
+            # 如果请求中没有指定 calendar_name，使用默认值
+            calendar_name = event_request.calendar_name or "TimeFlow"
+            
+            # 从请求中获取 tag，如果没有则从 calendar_name 推断
+            tag = getattr(event_request, 'tag', None) or calendar_name
+            
             event_data = {
                 "activity": event_request.activity,
                 "start_time": event_request.start_time,
                 "end_time": event_request.end_time,
                 "description": event_request.description or "",
-                "location": event_request.location or ""
+                "location": event_request.location or "",
+                "calendar_name": calendar_name,  # 支持指定日历（标签）
+                "tag": tag,  # 保存 tag 字段用于前端显示
+                "recurrence": event_request.recurrence  # 支持重复规则
             }
             
             result = add_to_calendar_via_applescript(event_data)
@@ -1139,6 +1584,72 @@ async def add_multiple_to_calendar_api(events: List[CalendarEventRequest]):
         return {
             "success": False,
             "error": str(e)
+        }
+
+
+@app.get("/api/calendar/recent")
+async def get_recent_events():
+    """
+    获取最近一次写入的日历事件（用于前端显示）
+    
+    Returns:
+        最近一次操作的所有事件
+    """
+    try:
+        # 优先从历史记录读取
+        if os.path.exists(EVENT_HISTORY_FILE):
+            with open(EVENT_HISTORY_FILE, 'r', encoding='utf-8') as f:
+                history = json.load(f)
+            
+            operations = history.get("operations", [])
+            if operations:
+                last_operation = operations[0]
+                events = last_operation.get("events", [])
+                # 确保每个事件都有 tag 字段（从 calendar_name 推断）
+                for event in events:
+                    if "tag" not in event or not event.get("tag"):
+                        event["tag"] = event.get("calendar_name", "生活")
+                return {
+                    "success": True,
+                    "events": events,
+                    "count": last_operation.get("count", 0),
+                    "created_at": last_operation.get("created_at")
+                }
+        
+        # Fallback：从最近事件文件读取
+        if os.path.exists(RECENT_EVENT_FILE):
+            with open(RECENT_EVENT_FILE, 'r', encoding='utf-8') as f:
+                events_info = json.load(f)
+            
+            events = events_info.get("events", [])
+            # 确保每个事件都有 tag 字段（从 calendar_name 推断）
+            for event in events:
+                if "tag" not in event or not event.get("tag"):
+                    event["tag"] = event.get("calendar_name", "生活")
+            if "event_id" in events_info:
+                # 旧格式兼容
+                events = [events_info]
+            
+            return {
+                "success": True,
+                "events": events,
+                "count": len(events),
+                "created_at": events_info.get("created_at")
+            }
+        
+        return {
+            "success": True,
+            "events": [],
+            "count": 0
+        }
+        
+    except Exception as e:
+        logger.error(f"获取最近事件异常: {str(e)}")
+        return {
+            "success": False,
+            "error": str(e),
+            "events": [],
+            "count": 0
         }
 
 
@@ -1205,6 +1716,360 @@ async def save_time_entry(entry: TimeEntry):
         }
 
 
+@app.get("/api/calendar/tags")
+async def get_calendar_tags():
+    """
+    获取用户日历中的标签和分类
+    返回：日历名称、常用关键词、活动分类等
+    """
+    try:
+        # 获取所有日历名称
+        calendars_script = '''
+        tell application "Calendar"
+            set calendarNames to {}
+            repeat with cal in calendars
+                set end of calendarNames to name of cal
+            end repeat
+            return calendarNames
+        end tell
+        '''
+        
+        calendars_result = subprocess.run(
+            ["osascript", "-e", calendars_script],
+            capture_output=True,
+            text=True,
+            timeout=10
+        )
+        
+        calendars = []
+        if calendars_result.returncode == 0:
+            calendars = [name.strip() for name in calendars_result.stdout.strip().split(',') if name.strip()]
+        
+        # 获取最近事件摘要（限制数量避免超时）
+        summaries_script = '''
+        tell application "Calendar"
+            set eventSummaries to {}
+            set startDate to (current date) - 30 * days
+            set endDate to (current date) + 1 * days
+            set eventCount to 0
+            
+            repeat with i from 1 to (count of calendars)
+                if i > 5 or eventCount >= 50 then exit repeat
+                try
+                    set cal to calendar i
+                    set eventsList to (every event of cal whose start date is greater than startDate and start date is less than endDate)
+                    repeat with evt in eventsList
+                        if eventCount >= 50 then exit repeat
+                        if summary of evt is not "" then
+                            set end of eventSummaries to summary of evt
+                            set eventCount to eventCount + 1
+                        end if
+                    end repeat
+                end try
+            end repeat
+            
+            return eventSummaries
+        end tell
+        '''
+        
+        summaries_result = subprocess.run(
+            ["osascript", "-e", summaries_script],
+            capture_output=True,
+            text=True,
+            timeout=30
+        )
+        
+        summaries = []
+        if summaries_result.returncode == 0:
+            summaries = [s.strip() for s in summaries_result.stdout.strip().split(',') if s.strip()]
+        
+        # 提取关键词
+        keywords = []
+        if summaries:
+            all_words = []
+            for summary in summaries:
+                cleaned = re.sub(r'[^\w\s\u4e00-\u9fff]', ' ', summary)
+                words = cleaned.split()
+                all_words.extend(words)
+            
+            word_freq = Counter(all_words)
+            filtered_words = {
+                word: count for word, count in word_freq.items()
+                if len(word) >= 2 and len(word) <= 10 and count >= 2
+            }
+            keywords = [word for word, count in sorted(filtered_words.items(), key=lambda x: x[1], reverse=True)[:20]]
+        
+        # 提取分类
+        categories = set()
+        activity_keywords = {
+            '工作': ['会议', '工作', '项目', '讨论', '汇报', 'ddl', 'submit', 'report'],
+            '学习': ['学习', '课程', '读书', '作业', '复习', 'test', 'exam'],
+            '运动': ['运动', '跑步', '健身', '游泳', '瑜伽', '跳舞', '遛'],
+            '娱乐': ['电影', '游戏', '音乐', '唱歌', '练歌'],
+            '社交': ['聚餐', '吃饭', '咖啡', '见面', '聚会'],
+            '生活': ['购物', '买菜', '做饭', '家务', '休息'],
+            '出行': ['出门', '通勤', '旅行', '出差', '回家'],
+        }
+        
+        for summary in summaries:
+            summary_lower = summary.lower()
+            for category, keywords_list in activity_keywords.items():
+                if any(keyword in summary_lower for keyword in keywords_list):
+                    categories.add(category)
+        
+        return {
+            "success": True,
+            "data": {
+                "calendars": calendars,
+                "keywords": keywords,
+                "categories": list(categories),
+                "recent_summaries": summaries[:10]  # 最近10个摘要作为参考
+            }
+        }
+        
+    except Exception as e:
+        logger.error(f"获取日历标签失败: {e}")
+        return {
+            "success": False,
+            "error": str(e),
+            "data": {
+                "calendars": [],
+                "keywords": [],
+                "categories": [],
+                "recent_summaries": []
+            }
+        }
+
+
+@app.get("/api/tags")
+async def get_tags():
+    """
+    获取所有标签配置
+    
+    Returns:
+        标签列表
+    """
+    try:
+        tags_config = load_tags_config()
+        return {
+            "success": True,
+            "tags": tags_config.get("tags", [])
+        }
+    except Exception as e:
+        logger.error(f"获取标签失败: {e}")
+        return {
+            "success": False,
+            "error": str(e),
+            "tags": []
+        }
+
+
+@app.post("/api/tags")
+async def create_tag(tag: dict):
+    """
+    创建新标签
+    
+    Args:
+        tag: 标签数据 {name, description, color}
+    
+    Returns:
+        创建结果
+    """
+    try:
+        tags_config = load_tags_config()
+        tags = tags_config.get("tags", [])
+        
+        # 生成新ID
+        new_id = tag.get("id") or f"tag_{len(tags) + 1}"
+        
+        # 检查名称是否重复
+        if any(t.get("name") == tag.get("name") for t in tags):
+            return {
+                "success": False,
+                "error": f"标签名称 '{tag.get('name')}' 已存在"
+            }
+        
+        new_tag = {
+            "id": new_id,
+            "name": tag.get("name", ""),
+            "description": tag.get("description", ""),
+            "color": tag.get("color", "#95E1D3"),
+            "is_default": False
+        }
+        
+        tags.append(new_tag)
+        tags_config["tags"] = tags
+        
+        with open(TAGS_FILE, 'w', encoding='utf-8') as f:
+            json.dump(tags_config, f, ensure_ascii=False, indent=2)
+        
+        logger.info(f"创建标签: {new_tag['name']}")
+        return {
+            "success": True,
+            "tag": new_tag
+        }
+    except Exception as e:
+        logger.error(f"创建标签失败: {e}")
+        return {
+            "success": False,
+            "error": str(e)
+        }
+
+
+@app.put("/api/tags/{tag_id}")
+async def update_tag(tag_id: str, tag: dict):
+    """
+    更新标签
+    
+    Args:
+        tag_id: 标签ID
+        tag: 更新的标签数据
+    
+    Returns:
+        更新结果
+    """
+    try:
+        tags_config = load_tags_config()
+        tags = tags_config.get("tags", [])
+        
+        # 找到要更新的标签
+        tag_index = None
+        for i, t in enumerate(tags):
+            if t.get("id") == tag_id:
+                tag_index = i
+                break
+        
+        if tag_index is None:
+            return {
+                "success": False,
+                "error": f"标签 ID '{tag_id}' 不存在"
+            }
+        
+        # 允许修改所有标签（包括默认标签）
+        old_tag = tags[tag_index]
+        
+        # 检查名称是否与其他标签重复
+        if tag.get("name") and tag.get("name") != old_tag.get("name"):
+            if any(t.get("name") == tag.get("name") for t in tags if t.get("id") != tag_id):
+                return {
+                    "success": False,
+                    "error": f"标签名称 '{tag.get('name')}' 已存在"
+                }
+        
+        # 更新标签
+        tags[tag_index].update({
+            "name": tag.get("name", old_tag.get("name")),
+            "description": tag.get("description", old_tag.get("description")),
+            "color": tag.get("color", old_tag.get("color"))
+        })
+        
+        tags_config["tags"] = tags
+        
+        with open(TAGS_FILE, 'w', encoding='utf-8') as f:
+            json.dump(tags_config, f, ensure_ascii=False, indent=2)
+        
+        logger.info(f"更新标签: {tag_id}")
+        
+        # 如果更新了颜色，同步更新苹果日历中对应日历的颜色
+        updated_tag = tags[tag_index]
+        if tag.get("color") and tag.get("color") != old_tag.get("color"):
+            try:
+                calendar_name = updated_tag.get("name")
+                tag_color = tag.get("color")
+                r, g, b = hex_to_rgb(tag_color)
+                
+                # 使用 AppleScript 更新日历颜色
+                commands = [
+                    'tell application "Calendar"',
+                    'activate',
+                    f'set calendarName to "{escape_apple_script(calendar_name)}"',
+                    'try',
+                    f'set targetCalendar to calendar calendarName',
+                    f'set color of targetCalendar to {{{r}, {g}, {b}}}',
+                    'end try',
+                    'end tell'
+                ]
+                
+                escaped_commands = [c.replace("'", "'\\''") for c in commands]
+                cmd = "osascript " + " ".join([f"-e '{c}'" for c in escaped_commands])
+                
+                result = subprocess.run(
+                    cmd,
+                    shell=True,
+                    capture_output=True,
+                    text=True,
+                    timeout=5
+                )
+                
+                if result.returncode == 0:
+                    logger.info(f"已同步更新日历颜色: {calendar_name} -> {tag_color}")
+                else:
+                    logger.warning(f"同步日历颜色失败: {result.stderr.strip()}")
+            except Exception as e:
+                logger.warning(f"同步日历颜色异常: {e}")
+        
+        return {
+            "success": True,
+            "tag": tags[tag_index]
+        }
+    except Exception as e:
+        logger.error(f"更新标签失败: {e}")
+        return {
+            "success": False,
+            "error": str(e)
+        }
+
+
+@app.delete("/api/tags/{tag_id}")
+async def delete_tag(tag_id: str):
+    """
+    删除标签（默认标签不允许删除）
+    
+    Args:
+        tag_id: 标签ID
+    
+    Returns:
+        删除结果
+    """
+    try:
+        tags_config = load_tags_config()
+        tags = tags_config.get("tags", [])
+        
+        # 找到要删除的标签
+        tag_index = None
+        for i, t in enumerate(tags):
+            if t.get("id") == tag_id:
+                tag_index = i
+                break
+        
+        if tag_index is None:
+            return {
+                "success": False,
+                "error": f"标签 ID '{tag_id}' 不存在"
+            }
+        
+        # 允许删除所有标签（包括默认标签）
+        # 注意：删除默认标签后，用户需要手动重新创建
+        
+        deleted_tag = tags.pop(tag_index)
+        tags_config["tags"] = tags
+        
+        with open(TAGS_FILE, 'w', encoding='utf-8') as f:
+            json.dump(tags_config, f, ensure_ascii=False, indent=2)
+        
+        logger.info(f"删除标签: {deleted_tag.get('name')}")
+        return {
+            "success": True,
+            "message": f"已删除标签: {deleted_tag.get('name')}"
+        }
+    except Exception as e:
+        logger.error(f"删除标签失败: {e}")
+        return {
+            "success": False,
+            "error": str(e)
+        }
+
+
 @app.get("/api/time-entries")
 async def get_time_entries(date: Optional[str] = None):
     """
@@ -1252,6 +2117,11 @@ async def get_time_entries(date: Optional[str] = None):
             "error": str(e)
         }
 
+
+# 在所有 API 路由注册后，挂载静态文件（避免覆盖 API 路由）
+# 注意：静态文件路由必须放在最后，否则会覆盖 /api/* 路由
+if os.path.exists(calendar_app_static_dir):
+    app.mount("/static", StaticFiles(directory=calendar_app_static_dir), name="static")
 
 if __name__ == "__main__":
     import uvicorn

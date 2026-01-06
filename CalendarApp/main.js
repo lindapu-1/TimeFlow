@@ -121,30 +121,77 @@ function createWindow() {
     if (!app.isQuitting) {
       event.preventDefault();
       mainWindow.hide();
+      // 窗口隐藏时取消快捷键注册
+      unregisterGlobalShortcut();
     }
   });
 
   mainWindow.on('minimize', (event) => {
     event.preventDefault();
     mainWindow.hide();
+    // 窗口隐藏时取消快捷键注册
+    unregisterGlobalShortcut();
+  });
+  
+  // 窗口显示时注册快捷键
+  mainWindow.on('show', () => {
+    registerGlobalShortcut();
+  });
+  
+  // 窗口隐藏时取消快捷键
+  mainWindow.on('hide', () => {
+    unregisterGlobalShortcut();
+  });
+  
+  // 窗口聚焦时注册快捷键（确保只在应用激活时响应）
+  mainWindow.on('focus', () => {
+    registerGlobalShortcut();
+  });
+  
+  // 窗口失焦时取消快捷键（避免与其他应用冲突）
+  mainWindow.on('blur', () => {
+    unregisterGlobalShortcut();
+    isShortcutPressed = false; // 重置状态
   });
 }
 
-// 注册全局快捷键
+// 注册全局快捷键（只在窗口可见且聚焦时注册）
+let isShortcutPressed = false;
+
 function registerGlobalShortcut() {
+  // 先取消所有已注册的快捷键，避免冲突
+  globalShortcut.unregisterAll();
+  
+  // 注册快捷键按下事件
   const ret = globalShortcut.register('CommandOrControl+Shift+T', () => {
-    if (mainWindow) {
-      mainWindow.webContents.send('toggle-recording');
-      // 显示窗口（如果隐藏）
-      if (!mainWindow.isVisible()) {
-        mainWindow.show();
+    // 只在窗口可见且聚焦时才响应快捷键
+    if (mainWindow && mainWindow.isVisible() && mainWindow.isFocused() && !isShortcutPressed) {
+      isShortcutPressed = true;
+      mainWindow.webContents.send('start-recording');
+      // 通知前端快捷键已按下
+      if (mainWindow.webContents) {
+        mainWindow.webContents.executeJavaScript(`
+          if (window.electronAPI && window.electronAPI.notifyShortcutPressed) {
+            window.electronAPI.notifyShortcutPressed();
+          }
+        `);
       }
     }
   });
 
   if (!ret) {
-    console.log('快捷键注册失败');
+    console.log('⚠️ 快捷键注册失败，可能已被其他应用占用（如 Cursor）');
+    console.log('💡 提示：请关闭 Cursor 或其他应用的 Cmd+Shift+T 快捷键');
+    console.log('💡 或者：只在应用窗口打开时使用快捷键（窗口聚焦时自动注册）');
+  } else {
+    console.log('✅ 全局快捷键已注册（仅在窗口可见且聚焦时生效）');
   }
+}
+
+// 取消全局快捷键
+function unregisterGlobalShortcut() {
+  globalShortcut.unregister('CommandOrControl+Shift+T');
+  console.log('✅ 全局快捷键已取消注册');
 }
 
 // 添加到苹果日历（使用 AppleScript）
@@ -221,6 +268,18 @@ ipcMain.on('toggle-recording', () => {
   }
 });
 
+// 监听快捷键状态更新（从前端发送）
+ipcMain.on('shortcut-pressed', () => {
+  isShortcutPressed = true;
+});
+
+ipcMain.on('shortcut-released', () => {
+  isShortcutPressed = false;
+  if (mainWindow && mainWindow.isVisible()) {
+    mainWindow.webContents.send('stop-recording');
+  }
+});
+
 ipcMain.on('add-to-calendar', async (event, eventData) => {
   try {
     await addToCalendar(eventData);
@@ -228,6 +287,36 @@ ipcMain.on('add-to-calendar', async (event, eventData) => {
   } catch (error) {
     event.reply('calendar-added', { success: false, error: error.message });
   }
+});
+
+// 打开系统设置
+ipcMain.handle('open-system-preferences', async (event, pane) => {
+  const { exec } = require('child_process');
+  return new Promise((resolve, reject) => {
+    let url;
+    switch (pane) {
+      case 'microphone':
+        url = 'x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone';
+        break;
+      case 'accessibility':
+        url = 'x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility';
+        break;
+      case 'sound':
+      case 'audio':
+        url = 'x-apple.systempreferences:com.apple.preference.sound?Input';
+        break;
+      default:
+        url = 'x-apple.systempreferences:com.apple.preference.security';
+    }
+    
+    exec(`open "${url}"`, (error) => {
+      if (error) {
+        reject(error);
+      } else {
+        resolve(true);
+      }
+    });
+  });
 });
 
 // 应用启动

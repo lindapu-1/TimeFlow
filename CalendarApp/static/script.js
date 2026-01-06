@@ -3,37 +3,38 @@ const API_BASE_URL = 'http://127.0.0.1:8000';
 let mediaRecorder;
 let audioChunks = [];
 let isRecording = false;
-let testMode = false; // 测试模式开关
 let currentTranscript = ''; // 当前转写文本
 let currentEventData = null; // 当前时间数据（可能是数组）
 let currentEvents = []; // 当前多个事件数据（数组格式）
-let currentSTTModel = ''; // 当前使用的 STT 模型
-
+let isProgrammaticUpdate = false; // 标记是否是程序自动更新文本（而非用户手动编辑）
 // DOM 元素
-const testModeBtn = document.getElementById('testModeBtn');
 const recordBtn = document.getElementById('recordBtn');
 const recordText = recordBtn.querySelector('.record-text');
 const textArea = document.getElementById('textArea');
 const transcriptText = document.getElementById('transcriptText');
-const timeDataArea = document.getElementById('timeDataArea');
-const dataActivity = document.getElementById('dataActivity');
-const dataStartTime = document.getElementById('dataStartTime');
-const dataEndTime = document.getElementById('dataEndTime');
-const dataDescription = document.getElementById('dataDescription');
-const manualActions = document.getElementById('manualActions');
+const recentEventsArea = document.getElementById('recentEventsArea');
+const recentEventsList = document.getElementById('recentEventsList');
 const analyzeBtn = document.getElementById('analyzeBtn');
-const confirmBtn = document.getElementById('confirmBtn');
 const undoBtn = document.getElementById('undoBtn');
+const settingsBtn = document.getElementById('settingsBtn');
 const statusArea = document.getElementById('statusArea');
 const statusText = document.getElementById('statusText');
-const sttModelInfo = document.getElementById('sttModelInfo');
+const analysisError = document.getElementById('analysisError');
+const settingsModal = document.getElementById('settingsModal');
+const closeSettingsBtn = document.getElementById('closeSettingsBtn');
+const tagsList = document.getElementById('tagsList');
+const addTagBtn = document.getElementById('addTagBtn');
+
+let operationStartTime = null; // 记录操作开始时间（用于计算用时）
 
 // 初始化
 document.addEventListener('DOMContentLoaded', () => {
-    console.log('页面加载完成，sttModelInfo 元素:', sttModelInfo);
     setupEventListeners();
     checkBackend();
-    loadTestMode();
+    loadRecentEvents(); // 加载最近事件
+    
+    // 初始状态：隐藏"识别时间点"按钮
+    analyzeBtn.classList.add('hidden');
 });
 
 // 检查后端是否运行
@@ -50,40 +51,111 @@ async function checkBackend() {
 
 // 设置事件监听
 function setupEventListeners() {
-    // 测试模式切换
-    testModeBtn.addEventListener('click', toggleTestMode);
+    // 录音按钮：按住录音（mousedown/touchstart 开始，mouseup/touchend 停止）
+    recordBtn.addEventListener('mousedown', startRecordingOnHold);
+    recordBtn.addEventListener('mouseup', stopRecordingOnHold);
+    recordBtn.addEventListener('mouseleave', stopRecordingOnHold); // 鼠标移出也停止
+    recordBtn.addEventListener('touchstart', (e) => {
+        e.preventDefault();
+        startRecordingOnHold();
+    });
+    recordBtn.addEventListener('touchend', (e) => {
+        e.preventDefault();
+        stopRecordingOnHold();
+    });
     
-    // 录音按钮
-    recordBtn.addEventListener('click', toggleRecording);
-    
-    // 文本框编辑
-    transcriptText.addEventListener('input', () => {
+    // 文本框编辑：检测手动编辑，显示"识别时间点"按钮
+    transcriptText.addEventListener('input', (e) => {
         currentTranscript = transcriptText.value;
-    });
-    
-    // 重置时清除 STT 模型显示
-    function resetSTTModelDisplay() {
-        if (sttModelInfo) {
-            sttModelInfo.textContent = 'STT: -';
-            currentSTTModel = '';
+        
+        // 如果是程序自动更新，不显示按钮
+        if (isProgrammaticUpdate) {
+            isProgrammaticUpdate = false; // 重置标志
+            return;
         }
-    }
-    
-    // 测试模式下的手动操作按钮
-    analyzeBtn.addEventListener('click', () => {
-        analyzeTranscriptManual(transcriptText.value);
+        
+        // 用户手动编辑时，隐藏之前的错误提示
+        hideAnalysisError();
+        
+        // 用户手动编辑：显示按钮
+        if (transcriptText.value.trim()) {
+            analyzeBtn.classList.remove('hidden');
+        } else {
+            analyzeBtn.classList.add('hidden');
+        }
     });
     
-    confirmBtn.addEventListener('click', () => {
-        addToCalendar();
+    // 监听鼠标点击和键盘输入，确保能检测到手动编辑
+    transcriptText.addEventListener('focus', () => {
+        // 当文本框获得焦点时，如果有文本且是手动编辑，显示按钮
+        if (transcriptText.value.trim() && !isProgrammaticUpdate) {
+            analyzeBtn.classList.remove('hidden');
+        }
+    });
+    
+    // 文本框回车键快速分析（Shift+Enter 换行）
+    transcriptText.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter' && !e.shiftKey) {
+            e.preventDefault();
+            if (transcriptText.value.trim()) {
+                analyzeTranscriptManual(transcriptText.value);
+            }
+        }
+    });
+    
+    // 识别时间点按钮（支持直接输入文本后分析）
+    analyzeBtn.addEventListener('click', () => {
+        const text = transcriptText.value.trim();
+        if (text) {
+            // 先隐藏之前的错误提示
+            hideAnalysisError();
+            analyzeTranscriptManual(text);
+        } else {
+            showStatus('❌ 请输入文本或先录音');
+        }
     });
     
     undoBtn.addEventListener('click', () => {
         undoLastEvents();
     });
     
-    // Electron IPC
+    // 标签设置
+    settingsBtn.addEventListener('click', () => {
+        openSettingsModal();
+    });
+    
+    closeSettingsBtn.addEventListener('click', () => {
+        closeSettingsModal();
+    });
+    
+    addTagBtn.addEventListener('click', () => {
+        addNewTag();
+    });
+    
+    // 点击模态框外部关闭
+    settingsModal.addEventListener('click', (e) => {
+        if (e.target === settingsModal) {
+            closeSettingsModal();
+        }
+    });
+    
+    // Electron IPC - 按住录音模式
     if (window.electronAPI) {
+        // 按住录音：开始
+        window.electronAPI.onStartRecording(() => {
+            if (!isRecording) {
+                startRecording();
+            }
+        });
+        
+        // 按住录音：停止
+        window.electronAPI.onStopRecording(() => {
+            if (isRecording) {
+                stopRecording();
+            }
+        });
+        
+        // 兼容旧的切换模式
         window.electronAPI.onToggleRecording(() => {
             toggleRecording();
         });
@@ -91,51 +163,121 @@ function setupEventListeners() {
         window.electronAPI.onCalendarAdded((data) => {
             if (data.success) {
                 const count = data.count || 1;
-                showStatus(`✅ 已添加 ${count} 个事件到苹果日历！`);
-                setTimeout(() => {
-                    resetUI();
-                }, 2000);
+                const elapsedSeconds = operationStartTime ? Math.round((Date.now() - operationStartTime) / 1000) : 0;
+                showSuccessMessage(`🎉 记录成功！用时 ${elapsedSeconds} 秒`);
+                loadRecentEvents();
+                resetUIAfterSuccess();
             } else {
                 showStatus(`❌ 添加失败: ${data.error}`);
+            }
+        });
+        
+        // 监听全局键盘事件（用于检测快捷键松开）
+        // 注意：Electron 的 globalShortcut 不支持 keyup，我们需要在页面中监听
+        let shortcutKeys = { cmd: false, shift: false, t: false };
+        
+        document.addEventListener('keydown', (e) => {
+            if (e.metaKey) shortcutKeys.cmd = true;
+            if (e.shiftKey) shortcutKeys.shift = true;
+            if (e.key.toLowerCase() === 't') shortcutKeys.t = true;
+            
+            // 检测是否按下了 Cmd+Shift+T
+            if (shortcutKeys.cmd && shortcutKeys.shift && shortcutKeys.t) {
+                if (window.electronAPI.notifyShortcutPressed) {
+                    window.electronAPI.notifyShortcutPressed();
+                }
+            }
+        });
+        
+        document.addEventListener('keyup', (e) => {
+            if (e.metaKey) shortcutKeys.cmd = false;
+            if (e.shiftKey) shortcutKeys.shift = false;
+            if (e.key.toLowerCase() === 't') shortcutKeys.t = false;
+            
+            // 检测是否松开了 Cmd+Shift+T
+            if (!shortcutKeys.cmd || !shortcutKeys.shift || !shortcutKeys.t) {
+                if (window.electronAPI.notifyShortcutReleased) {
+                    window.electronAPI.notifyShortcutReleased();
+                }
             }
         });
     }
 }
 
-// 切换测试模式
-function toggleTestMode() {
-    testMode = !testMode;
-    testModeBtn.textContent = testMode ? '自动' : '测试';
-    testModeBtn.classList.toggle('active', testMode);
-    saveTestMode();
-    showStatus(testMode ? '🧪 测试模式：每步需手动确认' : '🚀 自动模式：自动完成所有步骤');
-    setTimeout(() => hideStatus(), 2000);
+// 测试模式已移除，始终使用自动模式
+
+// 按住录音：开始
+async function startRecordingOnHold() {
+    if (isRecording) return; // 防止重复触发
+    await startRecording();
 }
 
-// 保存/加载测试模式状态
-function saveTestMode() {
-    localStorage.setItem('testMode', testMode);
+// 按住录音：停止
+function stopRecordingOnHold() {
+    if (!isRecording) return;
+    stopRecording();
 }
 
-function loadTestMode() {
-    testMode = localStorage.getItem('testMode') === 'true';
-    testModeBtn.textContent = testMode ? '自动' : '测试';
-    testModeBtn.classList.toggle('active', testMode);
-}
-
-// 切换录音状态
+// 切换录音状态（保留用于快捷键）
 async function toggleRecording() {
     if (!isRecording) {
         await startRecording();
     } else {
-        await stopRecording();
+        stopRecording();
+    }
+}
+
+// 检查可用的音频输入设备
+async function checkAudioDevices() {
+    try {
+        // 先请求权限（这样才能枚举设备）
+        await navigator.mediaDevices.getUserMedia({ audio: true });
+        const devices = await navigator.mediaDevices.enumerateDevices();
+        const audioInputs = devices.filter(device => device.kind === 'audioinput');
+        console.log('可用的音频输入设备:', audioInputs.map(d => d.label || d.deviceId));
+        return audioInputs;
+    } catch (error) {
+        console.error('枚举设备失败:', error);
+        // 如果权限被拒绝，返回空数组
+        return [];
     }
 }
 
 // 开始录音
 async function startRecording() {
     try {
-        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        // 先检查可用设备（需要先请求权限）
+        try {
+            const audioDevices = await checkAudioDevices();
+            if (audioDevices.length === 0) {
+                showStatus('❌ 未找到麦克风设备\n\n请检查：\n1. 麦克风是否已连接\n2. 系统设置 → 声音 → 输入\n3. 确保选择了正确的输入设备');
+                
+                // 提供打开声音设置的选项
+                setTimeout(() => {
+                    if (confirm('未找到麦克风设备。是否打开声音设置检查输入设备？')) {
+                        if (window.electronAPI && window.electronAPI.openSystemPreferences) {
+                            window.electronAPI.openSystemPreferences('sound');
+                        } else {
+                            alert('请手动打开：系统设置 → 声音 → 输入\n检查麦克风是否已连接并选择');
+                        }
+                    }
+                }, 1000);
+                return;
+            }
+            console.log(`找到 ${audioDevices.length} 个音频输入设备`);
+        } catch (deviceError) {
+            console.warn('设备检查失败，继续尝试录音:', deviceError);
+        }
+        
+        // 尝试获取麦克风权限并开始录音
+        const stream = await navigator.mediaDevices.getUserMedia({ 
+            audio: {
+                echoCancellation: true,
+                noiseSuppression: true,
+                autoGainControl: true
+            } 
+        });
+        
         mediaRecorder = new MediaRecorder(stream);
         audioChunks = [];
 
@@ -151,17 +293,55 @@ async function startRecording() {
 
         mediaRecorder.start();
         isRecording = true;
+        operationStartTime = Date.now(); // 记录操作开始时间
         recordBtn.classList.add('recording');
-        recordText.textContent = '停止';
+        recordText.textContent = '录音中...';
         showStatus('🎤 正在录音...');
         
-        // 重置UI
-        textArea.classList.add('hidden');
-        timeDataArea.classList.add('hidden');
-        manualActions.classList.add('hidden');
+        // 开始新录音时，隐藏之前的错误提示
+        hideAnalysisError();
     } catch (error) {
         console.error('录音错误:', error);
-        showStatus('❌ 无法访问麦克风');
+        
+        // 详细的错误提示
+        let errorMessage = '❌ 无法访问麦克风';
+        if (error.name === 'NotAllowedError' || error.name === 'PermissionDeniedError') {
+            errorMessage = '❌ 麦克风权限被拒绝\n请到系统设置 → 隐私与安全性 → 麦克风\n允许 Electron 应用访问麦克风';
+        } else if (error.name === 'NotFoundError') {
+            errorMessage = '❌ 未找到麦克风设备\n\n请检查：\n1. 麦克风是否已连接\n2. 系统设置 → 声音 → 输入\n3. 确保选择了正确的输入设备\n4. 尝试重新连接麦克风';
+        } else if (error.name === 'NotReadableError') {
+            errorMessage = '❌ 麦克风被其他应用占用\n请关闭其他使用麦克风的应用（如 Zoom、Teams 等）';
+        } else {
+            errorMessage = `❌ 录音错误: ${error.message || error.name}`;
+        }
+        
+        showStatus(errorMessage);
+        
+        // 如果是权限问题，提供修复提示
+        if (error.name === 'NotAllowedError' || error.name === 'PermissionDeniedError') {
+            setTimeout(() => {
+                if (confirm('需要授予麦克风权限。是否打开系统设置？')) {
+                    // 打开系统设置到麦克风权限页面
+                    if (window.electronAPI && window.electronAPI.openSystemPreferences) {
+                        window.electronAPI.openSystemPreferences('microphone');
+                    } else {
+                        // 网页端：无法直接打开系统设置，显示提示
+                        alert('请手动打开：系统设置 → 隐私与安全性 → 麦克风\n然后允许此网站访问麦克风');
+                    }
+                }
+            }, 1000);
+        } else if (error.name === 'NotFoundError') {
+            // 如果是设备未找到，提供打开声音设置的选项
+            setTimeout(() => {
+                if (confirm('未找到麦克风设备。是否打开声音设置检查输入设备？')) {
+                    if (window.electronAPI && window.electronAPI.openSystemPreferences) {
+                        window.electronAPI.openSystemPreferences('sound');
+                    } else {
+                        alert('请手动打开：系统设置 → 声音 → 输入\n检查麦克风是否已连接并选择');
+                    }
+                }
+            }, 1000);
+        }
     }
 }
 
@@ -171,7 +351,7 @@ function stopRecording() {
         mediaRecorder.stop();
         isRecording = false;
         recordBtn.classList.remove('recording');
-        recordText.textContent = '开始';
+        recordText.textContent = '按住录音';
         showStatus('⏳ 处理中...');
     }
 }
@@ -200,25 +380,13 @@ async function processAudio(audioBlob) {
             return;
         }
 
-        // 显示转写文本和模型信息
+        // 显示转写文本
         currentTranscript = transcript;
-        currentSTTModel = model;
+        // 程序自动填入转写文本，隐藏按钮
+        isProgrammaticUpdate = true;
         transcriptText.value = transcript;
-        updateSTTModelDisplay(model);
-        textArea.classList.remove('hidden');
+        analyzeBtn.classList.add('hidden');
         
-        if (testMode) {
-            // 测试模式：等待用户点击"识别时间点"
-            showStatus('✅ 转录完成，请点击"识别时间点"按钮');
-            // 确保按钮区域可见
-            manualActions.classList.remove('hidden');
-            analyzeBtn.classList.remove('hidden');
-            confirmBtn.classList.add('hidden');
-            // 显示时间数据区域（即使还没有数据，也要显示按钮）
-            timeDataArea.classList.remove('hidden');
-            return;
-        }
-
         // 自动模式：继续分析
         await analyzeAndSave(transcript);
         
@@ -235,38 +403,52 @@ async function analyzeAndSave(transcript) {
         showStatus('🤖 正在分析...');
         const analysis = await analyzeTranscriptAPI(transcript);
         
-        if (!analysis || !analysis.success || !analysis.data) {
+        if (!analysis || !analysis.success) {
             showStatus('❌ 分析失败');
+            showAnalysisError();
             return;
         }
 
         // 处理返回的数据（可能是数组或单个对象）
         const data = analysis.data;
+        
+        // 如果 data 是空数组或不存在，说明没有检测到有效的时间段
+        if (!data || (Array.isArray(data) && data.length === 0)) {
+            // 未检测出时间点，显示错误提示（不显示"分析失败"，因为分析是成功的，只是没有时间信息）
+            showAnalysisError();
+            hideStatus();
+            return;
+        }
+        
         if (Array.isArray(data)) {
             currentEvents = data;
             currentEventData = data.length > 0 ? data[0] : null; // 兼容旧代码
-            displayTimeDataMultiple(data);
         } else {
             currentEvents = [data];
             currentEventData = data;
-            displayTimeData(data);
         }
         
-        if (testMode) {
-            // 测试模式：等待用户点击"确认写入日历"
-            const count = currentEvents.length;
-            showStatus(`✅ 分析完成，识别到 ${count} 个时间块，请点击"确认写入日历"按钮`);
-            confirmBtn.classList.remove('hidden');
-            undoBtn.classList.remove('hidden'); // 显示撤回按钮
+        // 检查是否检测到时间点（双重检查，确保安全）
+        if (!currentEvents || currentEvents.length === 0) {
+            // 未检测出时间点，显示错误提示
+            showAnalysisError();
+            hideStatus();
             return;
         }
-
+        
+        // 隐藏错误提示（如果有）
+        hideAnalysisError();
+        
+        // 更新最近事件显示（分析完成后立即显示）
+        displayRecentEvents(currentEvents);
+        
         // 自动模式：直接写入日历
         await addToCalendar();
         
     } catch (error) {
         console.error('分析错误:', error);
         showStatus('❌ 分析失败: ' + (error.message || error));
+        showAnalysisError();
     }
 }
 
@@ -279,36 +461,52 @@ function addToCalendarPromise() {
 async function analyzeTranscriptManual(transcript) {
     try {
         showStatus('🤖 正在分析...');
+        
+        // 分析后隐藏按钮（等待下次手动编辑）
+        analyzeBtn.classList.add('hidden');
+        
         const analysis = await analyzeTranscriptAPI(transcript);
         
-        if (!analysis || !analysis.success || !analysis.data) {
+        if (!analysis || !analysis.success) {
             showStatus('❌ 分析失败');
             return;
         }
 
         // 处理返回的数据（可能是数组或单个对象）
         const data = analysis.data;
+        
+        // 如果 data 是空数组或不存在，说明没有检测到有效的时间段
+        if (!data || (Array.isArray(data) && data.length === 0)) {
+            // 未检测出时间点，显示错误提示（不显示"分析失败"，因为分析是成功的，只是没有时间信息）
+            showAnalysisError();
+            hideStatus();
+            return analysis;
+        }
+        
         if (Array.isArray(data)) {
             currentEvents = data;
             currentEventData = data.length > 0 ? data[0] : null; // 兼容旧代码
-            displayTimeDataMultiple(data);
         } else {
             currentEvents = [data];
             currentEventData = data;
-            displayTimeData(data);
         }
         
-        // 确保时间数据区域和按钮可见
-        timeDataArea.classList.remove('hidden');
-        manualActions.classList.remove('hidden');
-        
-        if (testMode) {
-            const count = currentEvents.length;
-            showStatus(`✅ 分析完成，识别到 ${count} 个时间块，请点击"确认写入日历"按钮`);
-            confirmBtn.classList.remove('hidden');
-            undoBtn.classList.remove('hidden'); // 显示撤回按钮
-            analyzeBtn.classList.add('hidden'); // 隐藏"识别时间点"按钮
+        // 检查是否检测到时间点（双重检查，确保安全）
+        if (!currentEvents || currentEvents.length === 0) {
+            // 未检测出时间点，显示错误提示
+            showAnalysisError();
+            hideStatus();
+            return analysis;
         }
+        
+        // 隐藏错误提示（如果有）
+        hideAnalysisError();
+        
+        // 更新最近事件显示（分析完成后立即显示）
+        displayRecentEvents(currentEvents);
+        
+        // 自动模式：直接写入日历
+        await addToCalendar();
         
         return analysis;
     } catch (error) {
@@ -359,25 +557,7 @@ async function transcribeAudio(audioBlob) {
 }
 
 // 更新 STT 模型显示
-function updateSTTModelDisplay(model) {
-    console.log('updateSTTModelDisplay called:', { model, sttModelInfo: !!sttModelInfo });
-    if (sttModelInfo && model) {
-        // 格式化模型名称显示
-        let displayName = model;
-        if (model.includes('FunASR') || model.includes('funasr')) {
-            displayName = 'FunASR';
-        } else if (model.includes('Faster-Whisper') || model.includes('Whisper')) {
-            displayName = model.replace('Faster-Whisper-', 'Whisper ').replace('Faster-', '');
-        } else if (model === 'cloud' || model === '云端') {
-            displayName = '云端 API';
-        }
-        sttModelInfo.textContent = `STT: ${displayName}`;
-        sttModelInfo.title = `当前使用的语音转写模型: ${model}`;
-        console.log('STT 模型显示已更新:', displayName);
-    } else {
-        console.warn('无法更新 STT 模型显示:', { sttModelInfo: !!sttModelInfo, model });
-    }
-}
+// updateSTTModelDisplay 函数已移除，不再显示转写模型名称
 
 // 分析文本 API
 async function analyzeTranscriptAPI(transcript) {
@@ -406,30 +586,14 @@ async function analyzeTranscriptAPI(transcript) {
     }
 }
 
-// 显示时间数据（单个事件）
+// 这些函数已不再使用（保留用于兼容）
 function displayTimeData(data) {
-    dataActivity.textContent = data.activity || '-';
-    dataStartTime.textContent = data.start_time ? formatDateTime(data.start_time) : '-';
-    dataEndTime.textContent = data.end_time ? formatDateTime(data.end_time) : '-';
-    dataDescription.textContent = data.description || data.status || '-';
-    timeDataArea.classList.remove('hidden');
+    // 已移除，现在使用 displayRecentEvents
 }
 
-// 显示多个时间数据
 function displayTimeDataMultiple(events) {
-    if (events.length === 0) {
-        displayTimeData({});
-        return;
-    }
-    
-    // 显示第一个事件的详细信息
-    displayTimeData(events[0]);
-    
-    // 如果有多个事件，在描述中显示总数
-    if (events.length > 1) {
-        const originalDesc = dataDescription.textContent;
-        dataDescription.textContent = `${originalDesc} (共 ${events.length} 个时间块)`;
-    }
+    // 已移除，现在使用 displayRecentEvents
+    displayRecentEvents(events);
 }
 
 // 格式化日期时间
@@ -455,20 +619,29 @@ async function addToCalendar() {
         const count = currentEvents.length;
         showStatus(`📅 正在添加 ${count} 个事件到日历...`);
         
+        let result;
         if (window.electronAPI) {
             // Electron 模式：通过 IPC 批量添加
-            await addMultipleToCalendarPromise(currentEvents);
-            showStatus(`✅ 已添加 ${count} 个事件到苹果日历！`);
-            setTimeout(() => {
-                resetUI();
-            }, 2000);
+            result = await addMultipleToCalendarPromise(currentEvents);
         } else {
             // 网页端：使用 API 批量添加
-            await addMultipleToCalendarAPI(currentEvents);
-            showStatus(`✅ 已添加 ${count} 个事件到日历！`);
-            setTimeout(() => {
-                resetUI();
-            }, 2000);
+            result = await addMultipleToCalendarAPI(currentEvents);
+        }
+        
+        if (result && result.success) {
+            // 计算用时
+            const elapsedSeconds = operationStartTime ? Math.round((Date.now() - operationStartTime) / 1000) : 0;
+            
+            // 显示成功提示（底部弹出）
+            showSuccessMessage(`🎉 记录成功！用时 ${elapsedSeconds} 秒`);
+            
+            // 重新加载最近事件（显示刚写入的事件）
+            await loadRecentEvents();
+            
+            // 重置 UI（但保留最近事件显示）
+            resetUIAfterSuccess();
+        } else {
+            throw new Error(result?.error || '添加失败');
         }
     } catch (error) {
         console.error('添加到日历错误:', error);
@@ -479,10 +652,45 @@ async function addToCalendar() {
 // 通过 API 批量添加到日历
 async function addMultipleToCalendarAPI(events) {
     try {
+        // 加载标签配置以获取颜色
+        let tagsMap = {};
+        try {
+            const tagsResponse = await fetch(`${API_BASE_URL}/api/tags`, {
+                signal: AbortSignal.timeout(3000)
+            });
+            if (tagsResponse.ok) {
+                const tagsResult = await tagsResponse.json();
+                if (tagsResult.success) {
+                    tagsResult.tags.forEach(tag => {
+                        tagsMap[tag.name] = tag.color || '#95E1D3';
+                    });
+                }
+            }
+        } catch (error) {
+            console.warn('加载标签配置失败:', error);
+        }
+        
+        // 转换事件格式，使用 tag 作为 calendar_name
+        const calendarEvents = events.map(event => {
+            const tag = event.tag || '生活';
+            const tagColor = tagsMap[tag] || '#95E1D3';
+            return {
+                activity: event.activity,
+                start_time: event.start_time,
+                end_time: event.end_time,
+                description: event.description || '',
+                location: event.location || '',
+                calendar_name: tag,  // 使用 tag 作为日历名称（标签）
+                tag: tag,  // 保存 tag 字段用于前端显示
+                tag_color: tagColor,  // 传递标签颜色给后端
+                recurrence: event.recurrence || null
+            };
+        });
+        
         const response = await fetch(`${API_BASE_URL}/api/calendar/add-multiple`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(events),
+            body: JSON.stringify(calendarEvents),
             signal: AbortSignal.timeout(30000)
         });
 
@@ -529,15 +737,49 @@ async function undoLastEvents() {
         }
 
         const result = await response.json();
-        if (result.success) {
+        
+        // 显示每个事件的撤回结果
+        if (result.results && result.results.length > 0) {
+            const messages = result.results.map(r => {
+                const activity = r.activity || '未命名活动';
+                if (r.success) {
+                    return `✅ "${activity}" 撤回成功`;
+                } else {
+                    // 优化错误消息显示
+                    let errorMsg = r.error || '未知错误';
+                    // 简化错误消息（移除技术细节）
+                    if (errorMsg.includes('-1728') || errorMsg.includes("Can't get event")) {
+                        errorMsg = '事件不存在（可能已被手动删除）';
+                    } else if (errorMsg.length > 50) {
+                        // 如果错误消息太长，只显示关键部分
+                        errorMsg = errorMsg.substring(0, 50) + '...';
+                    }
+                    return `❌ "${activity}" 撤回失败：${errorMsg}`;
+                }
+            });
+            
+            // 显示所有结果（每个事件一行）
+            showStatus(messages.join('\n'));
+            
+            // 如果至少有一个成功，重新加载最近事件
+            if (result.deleted_count > 0) {
+                await loadRecentEvents();
+            }
+            // 即使全部失败，也不抛出异常，而是显示详细结果
+        } else if (result.success) {
+            // 兼容旧格式（没有 results 字段）
             const count = result.deleted_count || 1;
             showStatus(`✅ 已撤回 ${count} 个事件`);
-            setTimeout(() => {
-                resetUI();
-            }, 2000);
+            await loadRecentEvents();
         } else {
+            // 只有在完全没有结果数据时才抛出异常
             throw new Error(result.error || '撤回失败');
         }
+        
+        // 5秒后自动隐藏（因为可能有多行消息）
+        setTimeout(() => {
+            hideStatus();
+        }, 5000);
     } catch (error) {
         console.error('撤回错误:', error);
         showStatus('❌ 撤回失败: ' + (error.message || error));
@@ -556,20 +798,344 @@ function hideStatus() {
 }
 
 // 重置 UI
-function resetUI() {
-    textArea.classList.add('hidden');
-    timeDataArea.classList.add('hidden');
-    manualActions.classList.add('hidden');
-    analyzeBtn.classList.remove('hidden');
-    confirmBtn.classList.add('hidden');
-    undoBtn.classList.add('hidden');
-    currentTranscript = '';
+// 重置 UI（写入成功后调用，保留转写文本框和最近事件显示）
+function resetUIAfterSuccess() {
+    // 不清空转写文本框，不清空最近事件
+    // 只重置当前操作相关的变量
     currentEventData = null;
     currentEvents = [];
-    currentSTTModel = '';
-    transcriptText.value = '';
-    if (sttModelInfo) {
-        sttModelInfo.textContent = 'STT: -';
-    }
+    operationStartTime = null;
+    // 不隐藏状态提示（让成功消息显示）
+}
+
+// 完全重置 UI（保留用于其他场景）
+function resetUI() {
+    resetUIAfterSuccess();
     hideStatus();
+}
+
+// 加载最近事件
+async function loadRecentEvents() {
+    try {
+        const response = await fetch(`${API_BASE_URL}/api/calendar/recent`, {
+            method: 'GET',
+            signal: AbortSignal.timeout(5000)
+        });
+
+        if (!response.ok) {
+            throw new Error(`获取最近事件失败 (${response.status})`);
+        }
+
+        const result = await response.json();
+        if (result.success && result.events && result.events.length > 0) {
+            displayRecentEvents(result.events);
+            undoBtn.classList.remove('hidden');
+        } else {
+            displayRecentEvents([]);
+            undoBtn.classList.add('hidden');
+        }
+    } catch (error) {
+        console.error('加载最近事件错误:', error);
+        displayRecentEvents([]);
+    }
+}
+
+// 显示最近事件（带标签和颜色）
+async function displayRecentEvents(events) {
+    if (!events || events.length === 0) {
+        recentEventsList.innerHTML = '<div class="recent-event-placeholder">暂无最近事件</div>';
+        undoBtn.classList.add('hidden');
+        return;
+    }
+    
+    undoBtn.classList.remove('hidden');
+    
+    // 加载标签配置（获取颜色）
+    let tagsMap = {};
+    try {
+        const tagsResponse = await fetch(`${API_BASE_URL}/api/tags`, {
+            signal: AbortSignal.timeout(3000)
+        });
+        if (tagsResponse.ok) {
+            const tagsResult = await tagsResponse.json();
+            if (tagsResult.success) {
+                tagsResult.tags.forEach(tag => {
+                    tagsMap[tag.name] = tag.color || '#95E1D3';
+                });
+            }
+        }
+    } catch (error) {
+        console.warn('加载标签配置失败:', error);
+    }
+    
+    const html = events.map(event => {
+        const startTime = event.start_time ? formatDateTime(event.start_time) : '-';
+        const endTime = event.end_time ? formatDateTime(event.end_time) : '-';
+        const activity = event.activity || '未命名活动';
+        const tag = event.tag || '生活';
+        const tagColor = tagsMap[tag] || '#95E1D3';
+        
+        return `
+            <div class="recent-event-item">
+                <div class="recent-event-header">
+                    <div class="recent-event-activity">${activity}</div>
+                    <span class="recent-event-tag" style="background-color: ${tagColor}">${tag}</span>
+                </div>
+                <div class="recent-event-time">${startTime} - ${endTime}</div>
+            </div>
+        `;
+    }).join('');
+    
+    recentEventsList.innerHTML = html;
+}
+
+// 显示成功消息（底部弹出）
+function showSuccessMessage(message) {
+    statusText.textContent = message;
+    statusArea.classList.remove('hidden');
+    statusArea.classList.add('success-message');
+    
+    // 3秒后自动隐藏
+    setTimeout(() => {
+        statusArea.classList.remove('success-message');
+        hideStatus();
+    }, 3000);
+}
+
+// 显示分析错误（未检测出时间点）
+function showAnalysisError() {
+    if (analysisError) {
+        analysisError.classList.remove('hidden');
+    }
+}
+
+// 隐藏分析错误
+function hideAnalysisError() {
+    if (analysisError) {
+        analysisError.classList.add('hidden');
+    }
+}
+
+// ========== 标签设置功能 ==========
+
+// 打开设置弹窗
+async function openSettingsModal() {
+    settingsModal.classList.remove('hidden');
+    await loadTags();
+}
+
+// 关闭设置弹窗
+function closeSettingsModal() {
+    settingsModal.classList.add('hidden');
+}
+
+// 加载标签列表
+async function loadTags() {
+    try {
+        const response = await fetch(`${API_BASE_URL}/api/tags`, {
+            signal: AbortSignal.timeout(5000)
+        });
+        
+        if (!response.ok) {
+            throw new Error(`获取标签失败 (${response.status})`);
+        }
+        
+        const result = await response.json();
+        if (result.success) {
+            displayTags(result.tags);
+        } else {
+            showStatus('❌ 加载标签失败: ' + (result.error || '未知错误'));
+        }
+    } catch (error) {
+        console.error('加载标签错误:', error);
+        showStatus('❌ 加载标签失败: ' + (error.message || error));
+    }
+}
+
+// 显示标签列表
+function displayTags(tags) {
+    if (!tags || tags.length === 0) {
+        tagsList.innerHTML = '<div class="no-tags">暂无标签</div>';
+        return;
+    }
+    
+    const html = tags.map(tag => {
+        const isDefault = tag.is_default || false;
+        
+        return `
+            <div class="tag-item" data-tag-id="${tag.id}">
+                <div class="tag-color-preview" style="background-color: ${tag.color || '#95E1D3'}"></div>
+                <div class="tag-content">
+                    <div class="tag-name-row">
+                        <input type="text" class="tag-name-input" value="${escapeHtml(tag.name)}" data-field="name">
+                        ${isDefault ? '<span class="tag-default-badge">默认</span>' : ''}
+                        <button class="tag-delete-btn" onclick="deleteTag('${tag.id}')">删除</button>
+                    </div>
+                    <input type="text" class="tag-desc-input" value="${escapeHtml(tag.description || '')}" placeholder="标签描述（用于 LLM 分类）" data-field="description">
+                    <div class="tag-color-row">
+                        <label>颜色：</label>
+                        <input type="color" class="tag-color-input" value="${tag.color || '#95E1D3'}" data-field="color">
+                    </div>
+                </div>
+            </div>
+        `;
+    }).join('');
+    
+    tagsList.innerHTML = html;
+    
+    // 绑定输入事件（自动保存）
+    tagsList.querySelectorAll('.tag-name-input, .tag-desc-input, .tag-color-input').forEach(input => {
+        let saveTimeout;
+        input.addEventListener('input', () => {
+            clearTimeout(saveTimeout);
+            saveTimeout = setTimeout(() => {
+                const tagItem = input.closest('.tag-item');
+                const tagId = tagItem.dataset.tagId;
+                saveTag(tagId, tagItem);
+            }, 1000); // 1秒后自动保存
+        });
+    });
+}
+
+// 转义HTML
+function escapeHtml(text) {
+    const div = document.createElement('div');
+    div.textContent = text;
+    return div.innerHTML;
+}
+
+// 保存标签（更新）
+async function saveTag(tagId, tagItem) {
+    const nameInput = tagItem.querySelector('.tag-name-input');
+    const descInput = tagItem.querySelector('.tag-desc-input');
+    const colorInput = tagItem.querySelector('.tag-color-input');
+    
+    const tagData = {
+        name: nameInput.value.trim(),
+        description: descInput.value.trim(),
+        color: colorInput.value
+    };
+    
+    if (!tagData.name) {
+        showStatus('❌ 标签名称不能为空');
+        return;
+    }
+    
+    try {
+        const response = await fetch(`${API_BASE_URL}/api/tags/${tagId}`, {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(tagData),
+            signal: AbortSignal.timeout(5000)
+        });
+        
+        const result = await response.json();
+        if (result.success) {
+            // 静默保存成功，不显示提示
+            console.log('标签已保存:', tagData.name);
+        } else {
+            showStatus('❌ 保存失败: ' + (result.error || '未知错误'));
+        }
+    } catch (error) {
+        console.error('保存标签错误:', error);
+        showStatus('❌ 保存失败: ' + (error.message || error));
+    }
+}
+
+// 删除标签
+async function deleteTag(tagId) {
+    if (!confirm('确定要删除这个标签吗？')) {
+        return;
+    }
+    
+    try {
+        const response = await fetch(`${API_BASE_URL}/api/tags/${tagId}`, {
+            method: 'DELETE',
+            signal: AbortSignal.timeout(5000)
+        });
+        
+        const result = await response.json();
+        if (result.success) {
+            showStatus('✅ ' + (result.message || '标签已删除'));
+            await loadTags(); // 重新加载标签列表
+        } else {
+            showStatus('❌ 删除失败: ' + (result.error || '未知错误'));
+        }
+    } catch (error) {
+        console.error('删除标签错误:', error);
+        showStatus('❌ 删除失败: ' + (error.message || error));
+    }
+}
+
+// 添加新标签
+function addNewTag() {
+    const newTagHtml = `
+        <div class="tag-item tag-item-new" data-tag-id="new">
+            <div class="tag-color-preview" style="background-color: #95E1D3"></div>
+            <div class="tag-content">
+                <div class="tag-name-row">
+                    <input type="text" class="tag-name-input" placeholder="标签名称" data-field="name">
+                    <button class="tag-save-btn" onclick="saveNewTag(this)">保存</button>
+                    <button class="tag-cancel-btn" onclick="cancelNewTag(this)">取消</button>
+                </div>
+                <input type="text" class="tag-desc-input" placeholder="标签描述（用于 LLM 分类）" data-field="description">
+                <div class="tag-color-row">
+                    <label>颜色：</label>
+                    <input type="color" class="tag-color-input" value="#95E1D3" data-field="color">
+                </div>
+            </div>
+        </div>
+    `;
+    
+    tagsList.insertAdjacentHTML('beforeend', newTagHtml);
+    
+    // 滚动到新标签
+    const newTagItem = tagsList.querySelector('.tag-item-new');
+    newTagItem.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+    newTagItem.querySelector('.tag-name-input').focus();
+}
+
+// 保存新标签
+async function saveNewTag(button) {
+    const tagItem = button.closest('.tag-item');
+    const nameInput = tagItem.querySelector('.tag-name-input');
+    const descInput = tagItem.querySelector('.tag-desc-input');
+    const colorInput = tagItem.querySelector('.tag-color-input');
+    
+    const tagData = {
+        name: nameInput.value.trim(),
+        description: descInput.value.trim(),
+        color: colorInput.value
+    };
+    
+    if (!tagData.name) {
+        showStatus('❌ 标签名称不能为空');
+        return;
+    }
+    
+    try {
+        const response = await fetch(`${API_BASE_URL}/api/tags`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(tagData),
+            signal: AbortSignal.timeout(5000)
+        });
+        
+        const result = await response.json();
+        if (result.success) {
+            showStatus('✅ 标签已创建');
+            await loadTags(); // 重新加载标签列表
+        } else {
+            showStatus('❌ 创建失败: ' + (result.error || '未知错误'));
+        }
+    } catch (error) {
+        console.error('创建标签错误:', error);
+        showStatus('❌ 创建失败: ' + (error.message || error));
+    }
+}
+
+// 取消添加新标签
+function cancelNewTag(button) {
+    const tagItem = button.closest('.tag-item-new');
+    tagItem.remove();
 }

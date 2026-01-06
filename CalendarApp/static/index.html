@@ -8,53 +8,52 @@
 </head>
 <body>
     <div class="container">
-        <!-- 测试模式切换按钮 -->
-        <button id="testModeBtn" class="test-mode-btn" title="测试模式">测试</button>
-        
-        <!-- 元素1：录音按钮 -->
+        <!-- 元素1：录音按钮（按住录音） -->
         <div class="recording-section">
             <button id="recordBtn" class="record-btn">
-                <span class="record-text">开始</span>
+                <span class="record-text">按住录音</span>
             </button>
-            <p class="shortcut-hint">快捷键: Cmd+Shift+T</p>
+            <p class="shortcut-hint">可以按住快捷键（Cmd+Shift+T）录音</p>
         </div>
 
-        <!-- 元素2：文本框（可编辑） -->
-        <div id="textArea" class="text-area hidden">
+        <!-- 元素2：文本框（可编辑，一直显示） -->
+        <div id="textArea" class="text-area">
             <div class="transcript-header">
                 <label class="text-label">转写文本：</label>
-                <span id="sttModelInfo" class="stt-model-info" title="当前使用的语音转写模型">STT: -</span>
             </div>
-            <textarea id="transcriptText" class="transcript-text" placeholder="转写文本将显示在这里，可以直接编辑..."></textarea>
+            <textarea id="transcriptText" class="transcript-text" placeholder="转写文本将显示在这里，也可以直接输入文本..."></textarea>
+            <div id="analysisError" class="analysis-error hidden">未检测出时间点</div>
+            <button id="analyzeBtn" class="analyze-text-btn hidden">识别时间点</button>
         </div>
 
-        <!-- 元素3：时间数据结构显示 -->
-        <div id="timeDataArea" class="time-data-area hidden">
-            <label class="data-label">时间数据：</label>
-            <div class="data-display">
-                <div class="data-item">
-                    <span class="data-key">活动：</span>
-                    <span id="dataActivity" class="data-value">-</span>
-                </div>
-                <div class="data-item">
-                    <span class="data-key">开始时间：</span>
-                    <span id="dataStartTime" class="data-value">-</span>
-                </div>
-                <div class="data-item">
-                    <span class="data-key">结束时间：</span>
-                    <span id="dataEndTime" class="data-value">-</span>
-                </div>
-                <div class="data-item">
-                    <span class="data-key">描述：</span>
-                    <span id="dataDescription" class="data-value">-</span>
+        <!-- 元素3：最近事件展示区 -->
+        <div id="recentEventsArea" class="recent-events-area">
+            <div class="recent-events-header">
+                <label class="recent-events-label">最近事件</label>
+                <div class="recent-events-actions">
+                    <button id="settingsBtn" class="settings-btn-header" title="标签设置">⚙️</button>
+                    <button id="undoBtn" class="undo-btn-header hidden" title="撤回最近一次操作">撤回</button>
                 </div>
             </div>
-            
-            <!-- 测试模式下的手动操作按钮 -->
-            <div id="manualActions" class="manual-actions hidden">
-                <button id="analyzeBtn" class="action-btn">识别时间点</button>
-                <button id="confirmBtn" class="action-btn confirm-btn hidden">确认写入日历</button>
-                <button id="undoBtn" class="action-btn undo-btn hidden">撤回</button>
+            <div id="recentEventsList" class="recent-events-list">
+                <!-- 占位符：没有事件时显示 -->
+                <div class="recent-event-placeholder">暂无最近事件</div>
+            </div>
+        </div>
+
+        <!-- 标签设置弹窗 -->
+        <div id="settingsModal" class="settings-modal hidden">
+            <div class="settings-modal-content">
+                <div class="settings-modal-header">
+                    <h3>标签设置</h3>
+                    <button id="closeSettingsBtn" class="close-btn">×</button>
+                </div>
+                <div class="settings-modal-body">
+                    <div id="tagsList" class="tags-list">
+                        <!-- 标签列表将动态加载 -->
+                    </div>
+                    <button id="addTagBtn" class="add-tag-btn">+ 添加新标签</button>
+                </div>
             </div>
         </div>
 
