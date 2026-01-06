@@ -1,0 +1,25 @@
+fastapi==0.104.1
+uvicorn==0.24.0
+python-dotenv==1.0.0
+openai==1.3.0
+requests==2.31.0
+pydantic==2.5.0
+python-multipart==0.0.6
+httpx==0.25.0
+faster-whisper>=1.0.0  # 本地语音转录（备用）
+funasr>=1.0.0  # FunASR中文语音识别（默认，最准确）
+modelscope>=1.0.0  # FunASR依赖
+torchaudio>=2.0.0  # FunASR依赖
+
+# 云端STT API依赖
+deepgram-sdk>=3.0.0  # Deepgram API
+google-cloud-speech>=2.0.0  # Google Cloud Speech-to-Text API
+librosa>=0.10.0  # 音频处理（用于获取音频时长）
+pydub>=0.25.0  # 音频格式转换（备选）
+
+# 快捷键录音测试依赖
+pynput>=1.7.6  # 全局快捷键监听
+sounddevice>=0.4.6  # 音频录制
+soundfile>=0.12.1  # 音频文件保存（或使用scipy）
+numpy>=1.24.0  # 音频数据处理
+

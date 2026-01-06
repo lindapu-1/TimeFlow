@@ -1,0 +1,45 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+.venv
+
+# Node.js
+node_modules/
+package-lock.json
+
+# 环境变量
+.env
+
+# 数据文件
+data/
+*.json
+
+# 文档和基准测试
+docs/
+benchmarks/
+
+# 测试录音文件
+**/测试录音/
+*.m4a
+*.mp3
+*.wav
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+
+
+
