@@ -1,9 +1,12 @@
 #!/bin/bash
 # 快速重启后端服务
 
-cd "$(dirname "$0")"
+# 切换到脚本所在目录的上一级（TimeFlow 根目录）
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+cd "$SCRIPT_DIR/.."
 
 echo "🔄 重启后端服务..."
+echo "📁 工作目录: $(pwd)"
 echo ""
 
 # 停止占用 8000 端口的进程

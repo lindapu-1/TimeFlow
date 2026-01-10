@@ -13,6 +13,10 @@ ENV/
 node_modules/
 package-lock.json
 
+# Electron build output
+CalendarApp/dist/
+MacApp/dist/
+
 # 环境变量
 .env
 
@@ -20,9 +24,11 @@ package-lock.json
 data/
 *.json
 
-# 文档和基准测试
-docs/
-benchmarks/
+# 文档和基准测试（保留文档，只忽略结果文件）
+# docs/  # 允许提交文档
+# benchmarks/  # 允许提交基准测试脚本
+benchmarks/results/*.json
+docs/benchmarks/results/*.json
 
 # 测试录音文件
 **/测试录音/
@@ -41,5 +47,6 @@ benchmarks/
 Thumbs.db
 
 
-
+#gitignore
+.gitignore
 

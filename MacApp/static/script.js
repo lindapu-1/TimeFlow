@@ -293,7 +293,8 @@ async function startRecording() {
 
         mediaRecorder.start();
         isRecording = true;
-        operationStartTime = Date.now(); // 记录操作开始时间
+        // 注意：operationStartTime 不在录音开始时设置，而是在处理开始时设置（processAudio）
+        // 这样只计算处理时间（STT + AI分析 + 写入日历），不包括录音时间
         recordBtn.classList.add('recording');
         recordText.textContent = '录音中...';
         showStatus('🎤 正在录音...');
@@ -358,6 +359,9 @@ function stopRecording() {
 
 // 处理音频（自动模式）
 async function processAudio(audioBlob) {
+    // 在处理开始时记录时间（不包括录音时间）
+    operationStartTime = Date.now();
+    
     try {
         // 1. 转录
         showStatus('📝 正在转录...');
@@ -459,6 +463,9 @@ function addToCalendarPromise() {
 
 // 分析文本（测试模式手动调用）
 async function analyzeTranscriptManual(transcript) {
+    // 在处理开始时记录时间（手动分析模式）
+    operationStartTime = Date.now();
+    
     try {
         showStatus('🤖 正在分析...');
         

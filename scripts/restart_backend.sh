@@ -45,11 +45,14 @@ sleep 1
 echo "3️⃣  启动新的后端服务..."
 echo ""
 
-cd "$(dirname "$0")"
+# 切换到脚本所在目录的上一级（TimeFlow 根目录）
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+cd "$SCRIPT_DIR/.."
 
 # 检查后端文件是否存在
 if [ ! -f "app.py" ]; then
     echo "❌ 错误: 找不到 app.py 文件"
+    echo "   当前目录: $(pwd)"
     exit 1
 fi
 

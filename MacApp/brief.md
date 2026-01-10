@@ -249,7 +249,7 @@ objective:
 
 | 方法 | 路径 | 功能 | 说明 | 状态 |
 |------|------|------|------|------|
-| GET | `/` | 返回前端页面 | 静态文件服务，优先使用 CalendarApp/static | ✅ 完成 |
+| GET | `/` | 返回前端页面 | 静态文件服务，优先使用 MacApp/static | ✅ 完成 |
 | POST | `/chat` | Chat 对话 | 通用 LLM 对话接口（Supermind） | ✅ 完成 |
 | POST | `/api/transcribe` | 转录音频 | FunASR → Faster Whisper → 云端 API | ✅ 完成 |
 | POST | `/api/analyze` | 提取时间事件 | Doubao → Supermind → Ollama | ✅ 完成 |

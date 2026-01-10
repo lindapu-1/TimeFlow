@@ -840,18 +840,18 @@ def undo_last_events_via_applescript() -> dict:
 @app.get("/")
 async def root():
     """返回前端页面"""
-    # 使用 CalendarApp 的前端文件
-    calendar_app_static = os.path.join("CalendarApp", "static", "index.html")
-    if os.path.exists(calendar_app_static):
-        return FileResponse(calendar_app_static)
+    # 使用 MacApp 的前端文件
+    mac_app_static = os.path.join("MacApp", "static", "index.html")
+    if os.path.exists(mac_app_static):
+        return FileResponse(mac_app_static)
     else:
-        raise FileNotFoundError("CalendarApp/static/index.html 不存在")
+        raise FileNotFoundError("MacApp/static/index.html 不存在")
 
 
 # 静态文件路由将在所有 API 路由注册后挂载（见文件末尾）
-calendar_app_static_dir = os.path.join("CalendarApp", "static")
-if not os.path.exists(calendar_app_static_dir):
-    raise FileNotFoundError("CalendarApp/static 目录不存在")
+mac_app_static_dir = os.path.join("MacApp", "static")
+if not os.path.exists(mac_app_static_dir):
+    raise FileNotFoundError("MacApp/static 目录不存在")
 
 
 @app.post("/chat")
@@ -2120,8 +2120,8 @@ async def get_time_entries(date: Optional[str] = None):
 
 # 在所有 API 路由注册后，挂载静态文件（避免覆盖 API 路由）
 # 注意：静态文件路由必须放在最后，否则会覆盖 /api/* 路由
-if os.path.exists(calendar_app_static_dir):
-    app.mount("/static", StaticFiles(directory=calendar_app_static_dir), name="static")
+if os.path.exists(mac_app_static_dir):
+    app.mount("/static", StaticFiles(directory=mac_app_static_dir), name="static")
 
 if __name__ == "__main__":
     import uvicorn

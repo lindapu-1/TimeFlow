@@ -1,9 +1,12 @@
 #!/bin/bash
 # 快捷键录音测试启动脚本
 
-cd "$(dirname "$0")"
+# 切换到脚本所在目录的上一级（TimeFlow 根目录）
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+cd "$SCRIPT_DIR/.."
 
 echo "🚀 启动快捷键录音测试..."
+echo "📁 工作目录: $(pwd)"
 echo ""
 
 # 检查后端服务
@@ -36,6 +39,6 @@ echo "============================================================"
 echo ""
 
 # 运行测试脚本
-python3 test_hotkey_recording.py
+python3 tests/test_hotkey_recording.py
 
 
