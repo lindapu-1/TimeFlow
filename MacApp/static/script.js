@@ -1,4 +1,7 @@
-const API_BASE_URL = 'http://127.0.0.1:8000';
+// 动态获取 API 基础地址：云端部署使用相对路径，本地开发使用当前主机
+const API_BASE_URL = window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1' 
+    ? 'http://127.0.0.1:8000' 
+    : '';
 
 let mediaRecorder;
 let audioChunks = [];
