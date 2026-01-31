@@ -7,9 +7,6 @@ pydantic==2.5.0
 python-multipart==0.0.6
 httpx==0.25.0
 faster-whisper>=1.0.0  # 本地语音转录（备用）
-funasr>=1.0.0  # FunASR中文语音识别（默认，最准确）
-modelscope>=1.0.0  # FunASR依赖
-torchaudio>=2.0.0  # FunASR依赖
 
 # 云端STT API依赖
 deepgram-sdk>=3.0.0  # Deepgram API

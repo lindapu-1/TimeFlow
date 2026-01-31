@@ -3,7 +3,7 @@
 TimeFlow MVP - 语音时间记录应用
 FastAPI 后端服务
 """
-from fastapi import FastAPI, File, UploadFile, Form
+from fastapi import FastAPI, File, UploadFile, Form, Request, HTTPException
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -23,17 +23,125 @@ import re
 from collections import Counter
 import re
 
+
+def normalize_transcript_text(text: str) -> str:
+    """
+    规范化转写文本显示：
+    - 去掉中文字符之间的多余空格（如“今 天 下 午”->“今天下午”）
+    - 规范标点前空格
+    - 合并多空格
+    """
+    if not text:
+        return ""
+    t = str(text).strip()
+    # 合并空白
+    t = re.sub(r"\s+", " ", t)
+    # 去掉中文字符之间的空格
+    t = re.sub(r"(?<=[\u4e00-\u9fff])\s+(?=[\u4e00-\u9fff])", "", t)
+    # 去掉标点前的空格
+    t = re.sub(r"\s+([，。！？；：,.!?;:])", r"\1", t)
+    return t.strip()
+
+
+def escape_html(text: str) -> str:
+    """将纯文本转为适合 Apple Notes body 的安全 HTML（最小化转义 + 换行）"""
+    if text is None:
+        return ""
+    t = str(text)
+    t = t.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    t = t.replace("\r\n", "\n").replace("\r", "\n")
+    t = t.replace("\n", "<br>")
+    return t
+
+
+def format_note_entry(event: dict) -> str:
+    """
+    按用户期望格式生成一条备忘录记录：
+    MM-DD HH:MM-HH:MM
+    活动名称
+    """
+    start_time = event.get("start_time")
+    end_time = event.get("end_time")
+    activity = (event.get("activity") or "").strip()
+
+    def _fmt(iso: Optional[str], with_date: bool) -> str:
+        if not iso:
+            return ""
+        try:
+            dt = datetime.fromisoformat(str(iso).replace("Z", "+00:00"))
+            if dt.tzinfo:
+                dt = dt.astimezone().replace(tzinfo=None)
+            if with_date:
+                return dt.strftime("%m-%d %H:%M")
+            return dt.strftime("%H:%M")
+        except Exception:
+            return str(iso)
+
+    left = _fmt(start_time, True)
+    right = _fmt(end_time, False)
+    header = f"{left}-{right}".strip("-")
+    return f"{header}\n{activity}".strip()
+
+
+def append_to_notes_via_applescript(note_name: str, text_to_append: str) -> dict:
+    """
+    追加文本到 Apple Notes 的指定备忘录（按“名称”匹配）。
+    - 若找不到同名备忘录，则在第一个账户的第一个文件夹创建
+    - Notes 的 body 是 HTML，这里会把换行转成 <br>
+    """
+    try:
+        if not note_name:
+            note_name = "时间"
+        if not text_to_append:
+            return {"success": True, "message": "无需写入备忘录（内容为空）"}
+
+        note_name_escaped = escape_apple_script(note_name)
+        html_body = escape_html(text_to_append)
+        html_body_escaped = escape_apple_script(html_body)
+
+        commands = [
+            'tell application "Notes"',
+            'set targetNote to missing value',
+            'set targetFolder to missing value',
+            'set targetAccount to missing value',
+            'if (count of accounts) = 0 then error "未找到 Notes 账户"',
+            'set targetAccount to item 1 of accounts',
+            'if (count of folders of targetAccount) = 0 then error "未找到 Notes 文件夹"',
+            'set targetFolder to item 1 of folders of targetAccount',
+            'repeat with acc in accounts',
+            'repeat with fol in folders of acc',
+            'repeat with n in notes of fol',
+            f'if name of n is "{note_name_escaped}" then set targetNote to n',
+            'if targetNote is not missing value then exit repeat',
+            'end repeat',
+            'if targetNote is not missing value then exit repeat',
+            'end repeat',
+            'if targetNote is not missing value then exit repeat',
+            'end repeat',
+            'if targetNote is missing value then',
+            f'set targetNote to make new note at targetFolder with properties {{name:"{note_name_escaped}", body:""}}',
+            'end if',
+            'set oldBody to body of targetNote',
+            f'set newBody to oldBody & "<br><br>{html_body_escaped}"',
+            'set body of targetNote to newBody',
+            'return "success"',
+            'end tell',
+        ]
+
+        escaped_commands = [c.replace("'", "'\\''") for c in commands]
+        cmd = "osascript " + " ".join([f"-e '{c}'" for c in escaped_commands])
+        result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=30)
+        if result.returncode != 0:
+            return {"success": False, "error": (result.stderr or result.stdout or "Notes AppleScript 执行失败").strip()}
+        return {"success": True, "message": "已追加到备忘录"}
+    except subprocess.TimeoutExpired:
+        return {"success": False, "error": "写入备忘录超时"}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
 # 配置日志
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-
-# FunASR (优先使用，中文识别最准确)
-try:
-    from funasr import AutoModel
-    FUNASR_AVAILABLE = True
-except ImportError:
-    FUNASR_AVAILABLE = False
-    logger.warning("FunASR 未安装，中文转录功能不可用。安装: pip install funasr modelscope torchaudio")
 
 # Faster Whisper (可选，如果安装了)
 try:
@@ -81,16 +189,11 @@ TAGS_FILE = "data/tags.json"  # 存储标签配置（用户自定义标签）
 # 确保数据目录存在
 os.makedirs("data", exist_ok=True)
 
-# FunASR 模型（懒加载，默认使用）
-funasr_model = None
-FUNASR_MODEL_NAME = os.getenv("FUNASR_MODEL", "paraformer-zh")  # FunASR 中文模型（正确格式：paraformer-zh）
-USE_FUNASR = os.getenv("USE_FUNASR", "true").lower() == "true"  # 默认使用 FunASR
-
 # Faster Whisper 模型（懒加载，备用）
 whisper_model = None
 # 根据基准测试，tiny 是最快的模型（0.3秒），推荐用于实时场景
 WHISPER_MODEL_SIZE = os.getenv("WHISPER_MODEL_SIZE", "tiny")  # tiny, base, small, medium, large
-USE_LOCAL_STT = os.getenv("USE_LOCAL_STT", "false").lower() == "true"  # 如果FunASR不可用，使用Whisper
+USE_LOCAL_STT = os.getenv("USE_LOCAL_STT", "false").lower() == "true"  # 是否使用本地 STT（Faster Whisper）
 
 # Ollama 配置
 OLLAMA_API_URL = os.getenv("OLLAMA_API_URL", "http://localhost:11434")
@@ -100,37 +203,14 @@ USE_OLLAMA = os.getenv("USE_OLLAMA", "false").lower() == "true"
 
 # 豆包云端模型配置（根据基准测试，doubao-1-5-lite-32k-250115 是最佳模型：2.79秒，95.2%准确率）
 DOUBAO_API_URL = os.getenv("DOUBAO_API_URL", "https://ark.cn-beijing.volces.com/api/v3")
-DOUBAO_API_KEY = os.getenv("DOUBAO_API_KEY", "490b8b89-b9ed-44af-8a8b-f70d660ee797")
-DOUBAO_MODEL = os.getenv("DOUBAO_MODEL", "doubao-1-5-lite-32k-250115")
+DOUBAO_API_KEY = os.getenv("DOUBAO_API_KEY")  # 必须从环境变量读取，不要硬编码
+DOUBAO_MODEL = os.getenv("DOUBAO_MODEL", "doubao-seed-1-6-251015")
 USE_DOUBAO = os.getenv("USE_DOUBAO", "true").lower() == "true"  # 默认使用豆包模型
 
+# 如果使用豆包模型但未提供 API key，给出警告（不强制，因为可能使用其他模型）
+if USE_DOUBAO and not DOUBAO_API_KEY:
+    logger.warning("⚠️  DOUBAO_API_KEY 未设置，豆包模型将不可用")
 
-def get_funasr_model():
-    """懒加载 FunASR 模型（包含标点符号恢复）"""
-    global funasr_model
-    if funasr_model is None and FUNASR_AVAILABLE:
-        try:
-            logger.info(f"加载 FunASR 模型: {FUNASR_MODEL_NAME}")
-            # 启用标点符号恢复：使用 punc_model 参数
-            # FunASR 会自动下载并使用标点符号恢复模型
-            funasr_model = AutoModel(
-                model=FUNASR_MODEL_NAME, 
-                model_revision="v2.0.4",
-                punc_model="ct-punc",  # 启用标点符号恢复模型
-                punc_model_revision="v2.0.4"
-            )
-            logger.info("✅ FunASR 模型加载成功（已启用标点符号恢复）")
-        except Exception as e:
-            logger.error(f"❌ FunASR 模型加载失败: {e}")
-            # 如果标点符号模型加载失败，尝试不使用标点符号模型（向后兼容）
-            try:
-                logger.warning("尝试加载不带标点符号的模型...")
-                funasr_model = AutoModel(model=FUNASR_MODEL_NAME, model_revision="v2.0.4")
-                logger.info("✅ FunASR 模型加载成功（未启用标点符号恢复）")
-            except Exception as e2:
-                logger.error(f"❌ FunASR 模型加载失败（无标点符号）: {e2}")
-                funasr_model = None
-    return funasr_model
 
 def get_whisper_model():
     """懒加载 Whisper 模型"""
@@ -391,6 +471,7 @@ class CalendarEventRequest(BaseModel):
     calendar_name: Optional[str] = None  # 日历名称（标签），默认使用 "TimeFlow"
     tag: Optional[str] = None  # 标签名称（用于前端显示）
     recurrence: Optional[str] = None  # 重复规则: "daily", "weekly", "monthly", "yearly"
+    note_name: Optional[str] = None  # 备忘录名称（默认“时间”）
 
 
 # 工具函数
@@ -880,105 +961,26 @@ async def transcribe_audio(
 ):
     """
     转录音频文件为文本
-    优先级：FunASR > Faster Whisper > 云端API
+    优先级：云端 API > Faster Whisper
     
     Args:
         audio_file: 音频文件
         language: 语言代码（如 zh-CN, en-US）
-        use_local: 是否使用本地 STT 模型（None时默认使用FunASR）
+        use_local: 是否使用本地 STT 模型（None时默认使用云端API）
     
     Returns:
         转录文本和元数据
     """
-    # 默认使用本地模型（FunASR优先）
-    use_local_stt = use_local if use_local is not None else (USE_FUNASR or USE_LOCAL_STT)
+    # 默认使用云端 API（准确率最高）
+    use_local_stt = use_local if use_local is not None else USE_LOCAL_STT
     
-    # 优先使用 FunASR（中文识别最准确）
-    if use_local_stt and USE_FUNASR and FUNASR_AVAILABLE:
-        try:
-            model = get_funasr_model()
-            if model is None:
-                raise Exception("FunASR 模型未加载")
-            
-            # 保存上传的文件到临时文件（保持原始格式）
-            audio_ext = os.path.splitext(audio_file.filename)[1] if audio_file.filename else '.wav'
-            if not audio_ext or audio_ext == '':
-                audio_ext = '.wav'  # 默认使用 wav
-            
-            with tempfile.NamedTemporaryFile(delete=False, suffix=audio_ext) as tmp_file:
-                content = await audio_file.read()
-                tmp_file.write(content)
-                tmp_file_path = tmp_file.name
-            
-            try:
-                # 转录音频
-                logger.info(f"FunASR 开始转写，文件: {tmp_file_path}")
-                res = model.generate(input=tmp_file_path)
-                transcript = res[0]["text"] if res and len(res) > 0 else ""
-                
-                if not transcript:
-                    raise Exception("FunASR 返回空文本")
-                
-                logger.info(f"FunASR 转录成功: {transcript[:50]}...")
-                
-                return {
-                    "success": True,
-                    "transcript": transcript,
-                    "detected_language": language.split('-')[0] if language else "zh",
-                    "confidence": 1.0,  # FunASR 不提供置信度
-                    "method": "local",
-                    "model": f"FunASR-{FUNASR_MODEL_NAME}"
-                }
-            finally:
-                # 清理临时文件
-                if os.path.exists(tmp_file_path):
-                    os.unlink(tmp_file_path)
-                
-        except Exception as e:
-            logger.error(f"FunASR 转录失败: {e}")
-            import traceback
-            logger.error(traceback.format_exc())
-            # 回退到其他模型
-            use_local_stt = True  # 继续尝试其他本地模型
+    # 记录所有尝试的模型和错误
+    stt_errors = []
+    tried_models = []
     
-    # 使用 Faster Whisper（备用本地模型）
-    if use_local_stt and FASTER_WHISPER_AVAILABLE:
-        try:
-            model = get_whisper_model()
-            if model is None:
-                raise Exception("Faster Whisper 模型未加载")
-            
-            # 保存上传的文件到临时文件
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp_file:
-                content = await audio_file.read()
-                tmp_file.write(content)
-                tmp_file_path = tmp_file.name
-            
-            try:
-                # 转录音频
-                segments, info = model.transcribe(tmp_file_path, language=language.split('-')[0] if language else None)
-                transcript = " ".join([segment.text for segment in segments])
-                
-                return {
-                    "success": True,
-                    "transcript": transcript,
-                    "detected_language": info.language,
-                    "confidence": info.language_probability,
-                    "method": "local",
-                    "model": f"Faster-Whisper-{WHISPER_MODEL_SIZE}"
-                }
-            finally:
-                # 清理临时文件
-                os.unlink(tmp_file_path)
-                
-        except Exception as e:
-            logger.error(f"本地转录失败: {e}")
-            # 回退到云端转录
-            use_local_stt = False
-    
-    # 使用云端转录 API（最后备选）
+    # 优先使用云端转录 API（准确率最高，推荐）
     if not use_local_stt:
-        # 使用云端转录 API
+        tried_models.append("云端 STT API")
         try:
             # 重置文件指针
             await audio_file.seek(0)
@@ -1017,11 +1019,68 @@ async def transcribe_audio(
                 raise Exception(f"云端转录 API 错误: {response.status_code} - {response.text}")
                 
         except Exception as e:
-            logger.error(f"云端转录失败: {e}")
-            return {
-                "success": False,
-                "error": str(e)
-            }
+            error_msg = str(e)
+            logger.error(f"云端转录失败: {error_msg}")
+            # 检查是否是额度限制错误
+            if "429" in error_msg or "limit" in error_msg.lower() or "quota" in error_msg.lower() or "SetLimitExceeded" in error_msg:
+                error_detail = f"云端 STT API 已达到使用限制（429错误）"
+            elif "401" in error_msg or "AuthenticationError" in error_msg:
+                error_detail = f"云端 STT API 认证失败（401错误）"
+            else:
+                error_detail = f"云端 STT API 调用失败：{error_msg[:100]}"
+            stt_errors.append(f"模型：云端 STT API - {error_detail}")
+            # 回退到本地模型
+            use_local_stt = True
+    
+    # 使用 Faster Whisper（备用本地模型）
+    if use_local_stt and FASTER_WHISPER_AVAILABLE:
+        tried_models.append(f"Faster Whisper ({WHISPER_MODEL_SIZE})")
+        try:
+            model = get_whisper_model()
+            if model is None:
+                raise Exception("Faster Whisper 模型未加载")
+            
+            # 保存上传的文件到临时文件
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp_file:
+                content = await audio_file.read()
+                tmp_file.write(content)
+                tmp_file_path = tmp_file.name
+            
+            try:
+                # 转录音频
+                segments, info = model.transcribe(tmp_file_path, language=language.split('-')[0] if language else None)
+                transcript = "".join([segment.text for segment in segments]).strip()
+                transcript = normalize_transcript_text(transcript)
+                
+                return {
+                    "success": True,
+                    "transcript": transcript,
+                    "detected_language": info.language,
+                    "confidence": info.language_probability,
+                    "method": "local",
+                    "model": f"Faster-Whisper-{WHISPER_MODEL_SIZE}"
+                }
+            finally:
+                # 清理临时文件
+                os.unlink(tmp_file_path)
+                
+        except Exception as e:
+            error_msg = str(e)
+            logger.error(f"本地转录失败: {e}")
+            stt_errors.append(f"模型：Faster Whisper ({WHISPER_MODEL_SIZE}) - {error_msg[:100]}")
+    
+    # 如果所有方法都失败
+    if not tried_models:
+        tried_models.append("无可用模型（Faster Whisper 未安装）")
+    
+    return {
+        "success": False,
+        "error": "所有转录方法都失败",
+        "step": "语音转文本",
+        "tried_models": tried_models,
+        "errors": stt_errors,
+        "error_summary": f"语音转文本步骤失败：已尝试 {len(tried_models)} 个模型，全部失败。详情：{'；'.join(stt_errors)}"
+    }
 
 
 @app.post("/api/analyze")
@@ -1040,9 +1099,14 @@ async def analyze_time_entry(request: TimeAnalysisRequest):
         logger.info(f"分析时间记录: {request.transcript}")
         
         # 决定使用哪个 AI（优先级：Doubao > Supermind > Ollama）
-        use_doubao = USE_DOUBAO  # 默认使用豆包
+        # 只有在 DOUBAO_API_KEY 存在时才使用豆包
+        use_doubao = USE_DOUBAO and bool(DOUBAO_API_KEY)  # 默认使用豆包，但需要 API key
         use_local_ai = request.use_ollama if request.use_ollama is not None else USE_OLLAMA
         use_supermind = True  # Supermind 作为第二优先级
+        
+        # 记录所有尝试的模型和错误
+        llm_errors = []
+        tried_llm_models = []
         
         # 获取当前时间
         current_time = datetime.now()
@@ -1082,6 +1146,7 @@ async def analyze_time_entry(request: TimeAnalysisRequest):
         
         if use_doubao:
             # 使用豆包云端模型（最佳性能：2.79秒，95.2%准确率）
+            tried_llm_models.append(f"豆包 ({DOUBAO_MODEL})")
             try:
                 logger.info(f"使用豆包模型: {DOUBAO_MODEL}")
                 
@@ -1112,18 +1177,30 @@ async def analyze_time_entry(request: TimeAnalysisRequest):
                     raise Exception(f"豆包 API 错误: {response.status_code} - {response.text}")
                     
             except requests.exceptions.ConnectionError:
+                error_msg = "连接失败"
                 logger.warning("豆包 API 连接失败，回退到 Supermind")
+                llm_errors.append(f"模型：豆包 ({DOUBAO_MODEL}) - 连接失败")
                 use_doubao = False
                 analysis_method = "supermind"
                 model_name = "supermind-agent-v1"
             except Exception as e:
-                logger.error(f"豆包调用失败: {str(e)}，回退到 Supermind")
+                error_msg = str(e)
+                logger.error(f"豆包调用失败: {error_msg}，回退到 Supermind")
+                # 检查是否是额度限制错误
+                if "429" in error_msg or "SetLimitExceeded" in error_msg or "limit" in error_msg.lower():
+                    error_detail = f"已达到使用限制（429错误）"
+                elif "401" in error_msg or "AuthenticationError" in error_msg:
+                    error_detail = f"认证失败（401错误）"
+                else:
+                    error_detail = f"调用失败：{error_msg[:100]}"
+                llm_errors.append(f"模型：豆包 ({DOUBAO_MODEL}) - {error_detail}")
                 use_doubao = False
                 analysis_method = "supermind"
                 model_name = "supermind-agent-v1"
         
         if not use_doubao and use_supermind:
             # 使用 Supermind 云端 API（第二优先级）
+            tried_llm_models.append("Supermind (supermind-agent-v1)")
             try:
                 logger.info("使用 Supermind 云端 API")
                 response = client.chat.completions.create(
@@ -1138,13 +1215,23 @@ async def analyze_time_entry(request: TimeAnalysisRequest):
                 ai_response = response.choices[0].message.content.strip()
                 logger.info(f"Supermind 响应: {ai_response[:100]}...")
             except Exception as e:
-                logger.error(f"Supermind 调用失败: {str(e)}，回退到本地 Ollama")
+                error_msg = str(e)
+                logger.error(f"Supermind 调用失败: {error_msg}，回退到本地 Ollama")
+                # 检查是否是额度限制错误
+                if "429" in error_msg or "limit" in error_msg.lower() or "quota" in error_msg.lower():
+                    error_detail = f"已达到使用限制（429错误）"
+                elif "401" in error_msg or "AuthenticationError" in error_msg:
+                    error_detail = f"认证失败（401错误）"
+                else:
+                    error_detail = f"调用失败：{error_msg[:100]}"
+                llm_errors.append(f"模型：Supermind (supermind-agent-v1) - {error_detail}")
                 use_supermind = False
                 analysis_method = "ollama" if use_local_ai else "supermind"
                 model_name = OLLAMA_MODEL if use_local_ai else "supermind-agent-v1"
         
         if not use_doubao and not use_supermind and use_local_ai:
             # 使用 Ollama 本地模型（Chat API，更适合结构化输出）
+            tried_llm_models.append(f"Ollama ({OLLAMA_MODEL})")
             try:
                 logger.info(f"使用 Ollama 模型: {OLLAMA_MODEL}")
                 
@@ -1173,18 +1260,24 @@ async def analyze_time_entry(request: TimeAnalysisRequest):
                     raise Exception(f"Ollama API 错误: {response.status_code} - {response.text}")
                     
             except requests.exceptions.ConnectionError:
+                error_msg = "服务器未运行"
                 logger.warning("Ollama 服务器未运行，回退到 Supermind")
+                llm_errors.append(f"模型：Ollama ({OLLAMA_MODEL}) - 服务器未运行")
                 use_local_ai = False
                 analysis_method = "supermind"
                 model_name = "supermind-agent-v1"
             except Exception as e:
-                logger.error(f"Ollama 调用失败: {str(e)}，回退到 Supermind")
+                error_msg = str(e)
+                logger.error(f"Ollama 调用失败: {error_msg}，回退到 Supermind")
+                llm_errors.append(f"模型：Ollama ({OLLAMA_MODEL}) - {error_msg[:100]}")
                 use_local_ai = False
                 analysis_method = "supermind"
                 model_name = "supermind-agent-v1"
         
         # 如果所有方法都失败，使用 Supermind 作为最后回退
         if not use_doubao and not use_supermind and not use_local_ai:
+            if "Supermind (supermind-agent-v1)" not in tried_llm_models:
+                tried_llm_models.append("Supermind (supermind-agent-v1)")
             logger.info("所有方法都失败，使用 Supermind 作为最后回退")
             try:
                 response = client.chat.completions.create(
@@ -1200,8 +1293,23 @@ async def analyze_time_entry(request: TimeAnalysisRequest):
                 analysis_method = "supermind"
                 model_name = "supermind-agent-v1"
             except Exception as e:
-                logger.error(f"Supermind 也失败: {str(e)}")
-                raise Exception("所有 AI 服务都不可用")
+                error_msg = str(e)
+                logger.error(f"Supermind 也失败: {error_msg}")
+                # 检查是否是额度限制错误
+                if "429" in error_msg or "limit" in error_msg.lower() or "quota" in error_msg.lower():
+                    error_detail = f"已达到使用限制（429错误）"
+                elif "401" in error_msg or "AuthenticationError" in error_msg:
+                    error_detail = f"认证失败（401错误）"
+                else:
+                    error_detail = f"调用失败：{error_msg[:100]}"
+                llm_errors.append(f"模型：Supermind (supermind-agent-v1) - {error_detail}")
+                
+                # 构建详细的错误信息
+                if not tried_llm_models:
+                    tried_llm_models.append("无可用模型")
+                
+                error_summary = f"时间提取步骤失败：已尝试 {len(tried_llm_models)} 个模型，全部失败。详情：{'；'.join(llm_errors)}"
+                raise Exception(error_summary)
         
         # 尝试提取 JSON（AI 可能返回带 markdown 代码块的 JSON）
         if "```json" in ai_response:
@@ -1442,13 +1550,178 @@ async def analyze_time_entry(request: TimeAnalysisRequest):
         }
         
     except Exception as e:
-        logger.error(f"分析异常: {str(e)}")
+        error_msg = str(e)
+        logger.error(f"分析异常: {error_msg}")
         import traceback
         traceback.print_exc()
+        
+        # 检查错误信息中是否包含模型信息
+        tried_models = tried_llm_models if 'tried_llm_models' in locals() else []
+        errors = llm_errors if 'llm_errors' in locals() else []
+        
         return {
             "success": False,
-            "error": str(e)
+            "error": error_msg,
+            "step": "时间提取",
+            "tried_models": tried_models if tried_models else ["未知"],
+            "errors": errors if errors else [error_msg],
+            "error_summary": error_msg if error_msg.startswith("时间提取步骤失败") else f"时间提取步骤失败：{error_msg}"
         }
+
+
+@app.post("/api/mobile/process")
+async def mobile_process(
+    request: Request,
+    audio_file: Optional[UploadFile] = File(None),
+    file: Optional[UploadFile] = File(None),
+    audio: Optional[UploadFile] = File(None),
+    recording: Optional[UploadFile] = File(None),
+):
+    """
+    移动端聚合接口：接收音频 -> 转写 -> 分析 -> 返回结构化 events
+    供 iOS 快捷指令使用。
+
+    兼容多种字段名（包括 iOS Shortcuts 可能出现的中文字段名），以及直接发送 audio/* 的情况。
+    """
+    try:
+        logger.info("收到移动端处理请求 /api/mobile/process")
+        content_type = request.headers.get("content-type", "")
+        logger.info(f"Content-Type: {content_type}")
+
+        audio_file_obj: Optional[UploadFile] = None
+
+        # 1) FastAPI 参数注入（最稳定）
+        for candidate, name in (
+            (audio_file, "audio_file"),
+            (file, "file"),
+            (audio, "audio"),
+            (recording, "recording"),
+        ):
+            if candidate is not None:
+                audio_file_obj = candidate
+                logger.info(f"找到音频文件字段: {name}")
+                break
+
+        # 2) iOS 可能会直接以 audio/* 发送原始 body
+        if audio_file_obj is None and content_type.startswith("audio/"):
+            body = await request.body()
+            if not body:
+                raise HTTPException(status_code=400, detail="请求体为空，未收到音频数据")
+
+            audio_ext = ".wav"
+            if "mpeg" in content_type or "mp3" in content_type:
+                audio_ext = ".mp3"
+            elif "mp4" in content_type or "m4a" in content_type:
+                audio_ext = ".m4a"
+
+            from io import BytesIO
+
+            audio_file_obj = UploadFile(
+                file=BytesIO(body),
+                filename=f"recording{audio_ext}",
+                headers={"content-type": content_type},
+            )
+            logger.info(f"从 raw body 读取音频成功，大小: {len(body)} bytes")
+
+        # 3) 手动解析 multipart（兼容中文字段名）
+        if audio_file_obj is None:
+            try:
+                form = await request.form()
+                keys = list(form.keys())
+                logger.info(f"表单字段: {keys}")
+
+                possible_field_names = [
+                    "audio_file",
+                    "录制的音频",
+                    "音频",
+                    "file",
+                    "audio",
+                    "recording",
+                ]
+                for field_name in possible_field_names:
+                    if field_name in form and isinstance(form[field_name], UploadFile):
+                        audio_file_obj = form[field_name]
+                        logger.info(f"找到音频文件字段(表单): {field_name}")
+                        break
+
+                if audio_file_obj is None:
+                    # 兜底：取第一个 UploadFile
+                    for k in keys:
+                        v = form.get(k)
+                        if isinstance(v, UploadFile):
+                            audio_file_obj = v
+                            logger.info(f"使用第一个文件字段(表单): {k}")
+                            break
+            except Exception as e:
+                # 典型：Missing boundary in multipart
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"无法解析表单数据: {e}. "
+                        "请在 iOS 快捷指令的“获取 URL 内容”里选择“请求体=文件”，"
+                        "并且不要手动设置 Content-Type（让系统自动带 boundary）。"
+                    ),
+                )
+
+        if audio_file_obj is None:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "未找到音频文件。请确保 iOS 快捷指令的“获取 URL 内容”使用 POST，"
+                    "请求体选择“文件”，并选中“录制的音频/文件”。"
+                ),
+            )
+
+        # 1) 转写
+        transcript_result = await transcribe_audio(audio_file=audio_file_obj, language="zh-CN", use_local=None)
+        if not transcript_result.get("success"):
+            # 返回详细的错误信息
+            error_info = {
+                "success": False,
+                "step": transcript_result.get("step", "语音转文本"),
+                "error": transcript_result.get("error", "未知错误"),
+                "error_summary": transcript_result.get("error_summary", transcript_result.get("error", "转写失败")),
+                "tried_models": transcript_result.get("tried_models", []),
+                "errors": transcript_result.get("errors", [])
+            }
+            return error_info
+
+        transcript = transcript_result.get("transcript", "")
+        transcript = normalize_transcript_text(transcript)
+
+        # 2) 分析
+        analysis_request = TimeAnalysisRequest(transcript=transcript)
+        analysis_result = await analyze_time_entry(analysis_request)
+        if not analysis_result.get("success"):
+            # 返回详细的错误信息
+            error_info = {
+                "success": False,
+                "step": analysis_result.get("step", "时间提取"),
+                "error": analysis_result.get("error", "未知错误"),
+                "error_summary": analysis_result.get("error_summary", analysis_result.get("error", "分析失败")),
+                "tried_models": analysis_result.get("tried_models", []),
+                "errors": analysis_result.get("errors", []),
+                "transcript": transcript  # 即使分析失败，也返回转录文本
+            }
+            return error_info
+
+        return {
+            "success": True,
+            "transcript": transcript,
+            "events": analysis_result.get("data", []),
+            "stt_method": transcript_result.get("method", "unknown"),  # 记录使用的 STT 方法
+            "llm_method": analysis_result.get("method", "unknown"),  # 记录使用的 LLM 方法
+            "llm_model": analysis_result.get("model", "unknown")  # 记录使用的 LLM 模型
+        }
+
+    except HTTPException as e:
+        logger.error(f"移动端处理失败: {e.detail}")
+        return {"success": False, "error": e.detail}
+    except Exception as e:
+        logger.error(f"移动端处理失败: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        return {"success": False, "error": str(e)}
 
 
 @app.post("/api/calendar/add")
@@ -1492,6 +1765,16 @@ async def add_to_calendar_api(request: CalendarEventRequest):
         result = add_to_calendar_via_applescript(event_data)
         
         if result.get("success"):
+            # 同时写入备忘录：追加到指定备忘录（默认“时间”）
+            try:
+                note_name = request.note_name or "时间"
+                note_text = format_note_entry(event_data)
+                notes_result = append_to_notes_via_applescript(note_name, note_text)
+                if not notes_result.get("success"):
+                    logger.warning(f"写入备忘录失败: {notes_result.get('error')}")
+            except Exception as e:
+                logger.warning(f"写入备忘录异常: {e}")
+
             return {
                 "success": True,
                 "event_id": result.get("event_id"),
@@ -1562,6 +1845,18 @@ async def add_multiple_to_calendar_api(events: List[CalendarEventRequest]):
         if event_ids:
             # 保存所有事件信息（用于撤回）
             save_recent_events(event_ids, events_data)
+
+            # 同时写入备忘录：把本次事件按两行格式追加（一次性追加，避免多次 AppleScript）
+            try:
+                note_name = (events[0].note_name if events and getattr(events[0], "note_name", None) else None) or "时间"
+                blocks = [format_note_entry(e) for e in events_data if isinstance(e, dict)]
+                note_text = "\n\n".join([b for b in blocks if b.strip()])
+                if note_text.strip():
+                    notes_result = append_to_notes_via_applescript(note_name, note_text)
+                    if not notes_result.get("success"):
+                        logger.warning(f"批量写入备忘录失败: {notes_result.get('error')}")
+            except Exception as e:
+                logger.warning(f"批量写入备忘录异常: {e}")
             
             return {
                 "success": True,

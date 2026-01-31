@@ -264,20 +264,18 @@ objective:
 ### 1. 语音转文字（STT）
 
 **优先级机制**：
-1. **FunASR**（默认，中文识别最准确）
-   - 模型：`paraformer-zh-16k-v2`
-   - 懒加载机制，首次调用时加载
-   - 环境变量：`USE_FUNASR=true`（默认）
-   - 环境变量：`FUNASR_MODEL=paraformer-zh-16k-v2`
+1. **云端 STT API**（默认，准确率最高，推荐）
+   - API：`https://space.ai-builders.com/backend/v1/audio/transcriptions`
+   - 准确率：95%+（根据测试对比）
+   - 响应时间：1-2秒
+   - 自动使用（无需配置）
 
-2. **Faster Whisper**（备用）
-   - 模型大小：`tiny`（最快，0.3秒）
+2. **Faster Whisper**（备用本地模型）
+   - 模型大小：`tiny`（最快，0.4秒）
    - 支持：`tiny`, `base`, `small`, `medium`, `large`
-   - 环境变量：`USE_LOCAL_STT=true`
+   - 环境变量：`USE_LOCAL_STT=true`（启用本地模型）
    - 环境变量：`WHISPER_MODEL_SIZE=tiny`
-
-3. **云端 API**（最后备用）
-   - Supermind API：`https://space.ai-builders.com/backend/v1/audio/transcriptions`
+   - 注意：准确率略低于云端 API（约62%相似度）
 
 **API 参数**：
 - `audio_file`: 音频文件（multipart/form-data）

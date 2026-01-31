@@ -26,6 +26,15 @@ const tagsList = document.getElementById('tagsList');
 const addTagBtn = document.getElementById('addTagBtn');
 
 let operationStartTime = null; // 记录操作开始时间（用于计算用时）
+let operationTranscribeMs = 0; // 仅语音转写耗时（不含写入日历）
+let operationAnalyzeMs = 0;    // 仅 AI 分析耗时（不含写入日历）
+
+function getSTTAndAnalysisSeconds() {
+    const ms = (operationTranscribeMs || 0) + (operationAnalyzeMs || 0);
+    if (ms > 0) return Math.round(ms / 1000);
+    // 兜底：如果没采集到分段耗时，再退回原来的整体耗时
+    return operationStartTime ? Math.round((Date.now() - operationStartTime) / 1000) : 0;
+}
 
 // 初始化
 document.addEventListener('DOMContentLoaded', () => {
@@ -163,8 +172,8 @@ function setupEventListeners() {
         window.electronAPI.onCalendarAdded((data) => {
             if (data.success) {
                 const count = data.count || 1;
-                const elapsedSeconds = operationStartTime ? Math.round((Date.now() - operationStartTime) / 1000) : 0;
-                showSuccessMessage(`🎉 记录成功！用时 ${elapsedSeconds} 秒`);
+                const elapsedSeconds = getSTTAndAnalysisSeconds();
+                showSuccessMessage(`🎉 记录成功！用时 ${elapsedSeconds} 秒（仅转写+分析）`);
                 loadRecentEvents();
                 resetUIAfterSuccess();
             } else {
@@ -361,11 +370,15 @@ function stopRecording() {
 async function processAudio(audioBlob) {
     // 在处理开始时记录时间（不包括录音时间）
     operationStartTime = Date.now();
+    operationTranscribeMs = 0;
+    operationAnalyzeMs = 0;
     
     try {
         // 1. 转录
         showStatus('📝 正在转录...');
+        const transcribeStart = performance.now();
         const transcribeResult = await transcribeAudio(audioBlob);
+        operationTranscribeMs = performance.now() - transcribeStart;
         
         // 处理返回结果（可能是对象或字符串）
         let transcript, model;
@@ -405,7 +418,9 @@ async function analyzeAndSave(transcript) {
     try {
         // 2. AI 分析
         showStatus('🤖 正在分析...');
+        const analyzeStart = performance.now();
         const analysis = await analyzeTranscriptAPI(transcript);
+        operationAnalyzeMs = performance.now() - analyzeStart;
         
         if (!analysis || !analysis.success) {
             showStatus('❌ 分析失败');
@@ -465,6 +480,8 @@ function addToCalendarPromise() {
 async function analyzeTranscriptManual(transcript) {
     // 在处理开始时记录时间（手动分析模式）
     operationStartTime = Date.now();
+    operationTranscribeMs = 0;
+    operationAnalyzeMs = 0;
     
     try {
         showStatus('🤖 正在分析...');
@@ -472,7 +489,9 @@ async function analyzeTranscriptManual(transcript) {
         // 分析后隐藏按钮（等待下次手动编辑）
         analyzeBtn.classList.add('hidden');
         
+        const analyzeStart = performance.now();
         const analysis = await analyzeTranscriptAPI(transcript);
+        operationAnalyzeMs = performance.now() - analyzeStart;
         
         if (!analysis || !analysis.success) {
             showStatus('❌ 分析失败');
@@ -636,11 +655,11 @@ async function addToCalendar() {
         }
         
         if (result && result.success) {
-            // 计算用时
-            const elapsedSeconds = operationStartTime ? Math.round((Date.now() - operationStartTime) / 1000) : 0;
+            // 仅统计：语音转写 + AI 分析（不包含写入日历耗时）
+            const elapsedSeconds = getSTTAndAnalysisSeconds();
             
             // 显示成功提示（底部弹出）
-            showSuccessMessage(`🎉 记录成功！用时 ${elapsedSeconds} 秒`);
+            showSuccessMessage(`🎉 记录成功！用时 ${elapsedSeconds} 秒（仅转写+分析）`);
             
             // 重新加载最近事件（显示刚写入的事件）
             await loadRecentEvents();
